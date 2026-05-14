@@ -1,0 +1,854 @@
+---
+title: "Predicting High-Income Migration: A County-Level Analysis of AGI Stub 8, 2019--2021"
+author: "Rhys Howell"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = FALSE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dev = "png",
+  dpi = 110,
+  fig.retina = 1
+)
+data_path <- "C:\\Users\\grays\\Downloads\\county_1920_May3AGI8_SK.csv"
+```
+
+```{r packages, include=FALSE}
+library(mosaic)
+library(tidyverse)
+library(corrplot)
+library(leaps)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(car)
+library(lmtest)
+library(MASS)
+library(sandwich)
+library(sf)
+library(tigris)
+library(patchwork)
+library(glmnet)
+library(caret)
+library(spdep)
+library(knitr)
+library(kableExtra)
+options(tigris_use_cache = TRUE)
+```
+
+```{r load-data, include=FALSE}
+df_raw <- read.csv(data_path, fileEncoding = "cp1252", check.names = TRUE)
+
+df_raw <- df_raw %>%
+  dplyr::select(-any_of(c("stname.1", "ctyname.1", "fips.1"))) %>%
+  mutate(
+    fips       = stringr::str_pad(as.character(fips),       5, "left", "0"),
+    STATEFIPS  = stringr::str_pad(as.character(STATEFIPS),  2, "left", "0"),
+    COUNTYFIPS = stringr::str_pad(as.character(COUNTYFIPS), 3, "left", "0")
+  )
+```
+
+```{r build-response, include=FALSE}
+df <- df_raw %>%
+  filter(agi_stub == 8) %>%
+  filter(!is.na(Returns19), !is.na(Returns21),
+         !is.na(Returns20),
+         !is.na(Individuals19), !is.na(Individuals21))
+
+df <- df %>%
+  mutate(
+    chg_returns_raw         = Returns21     - Returns19,
+    chg_individuals_raw     = Individuals21 - Individuals19,
+    chg_returns_per_1k      = (Returns21    - Returns19)    / popestimate * 1000,
+    chg_individuals_per_1k  = (Individuals21 - Individuals19)/ popestimate * 1000,
+    chg_returns_1920_per_1k = (Returns20    - Returns19)    / popestimate * 1000,
+    pct_chg_returns         = ifelse(Returns19 > 0,
+                                     (Returns21 - Returns19) / Returns19 * 100, NA_real_),
+    pct_chg_individuals     = ifelse(Individuals19 > 0,
+                                     (Individuals21 - Individuals19) / Individuals19 * 100,
+                                     NA_real_)
+  )
+```
+
+# Introduction
+
+The central question of this project is straightforward: where are high-income individuals moving, and what drives those decisions? Understanding the geographic redistribution of top-bracket earners carries first-order consequences for local public finance because when a household earning above \$200,000 relocates, it shifts income tax revenues, property values, and service demands in both origin and destination. Identifying the systematic forces behind those moves allows policymakers to anticipate fiscal stress and economists to evaluate the consequences of tax policy with much greater precision.
+
+This report uses Internal Revenue Service Statistics of Income (SOI) county-level data to analyze the change in the high-income taxpayer population across 3,134 U.S. counties between 2019 and 2021. The focus on AGI Stub 8, the bracket comprising all returns with adjusted gross income of \$200,000 or more, is deliberate. Top-bracket earners are both the most responsive to fiscal and economic incentives in their location choices and the most consequential for the local tax base: the top five percent of filers account for more than 38 percent of all federal income tax receipts.
+
+The 2019--2021 window is analytically rich. Nationally, stub-8 returns grew by 28.1 percent over just two years, rising from 8.79 million to 11.26 million which is a surge driven by a combination of strong nominal income growth, capital-market gains, and the pandemic-era relocation wave that redrew the residential geography of the American professional class. Explaining the county-level variation in that growth is the task of the model.
+
+# Data Sources and Construction
+
+The analysis dataset merges four primary sources at the five-digit county FIPS code. The IRS SOI county data provides stub-8 return counts and a rich suite of income composition, deduction, and tax liability variables computed directly from individual returns filed in each county-by-bracket cell; all dollar figures in the SOI files are in thousands of dollars. County-level personal income and GDP come from the Bureau of Economic Analysis regional accounts (CAINC1 and CAGDP1, 2019--2020 vintage). County population denominators come from the U.S. Census Bureau intercensal population estimates for 2020.
+
+A critical structural feature of the SOI data deserves early emphasis. Income composition and tax variables: labor share, tax per return, capital-gains incidence, and AGI per return, are observed at the county-by-stub level, meaning they describe stub-8 filers specifically within each county. Demographic controls such as working-age share and elderly share are county-wide Census variables that describe all residents regardless of income. This asymmetry between stub-specific tax variables and county-wide demographic proxies is a hard data constraint that limits inference and is treated in detail in the limitations section.
+
+# Response Variable
+
+## Candidate Measures
+
+Three response variables were evaluated. The raw change in returns ($\text{Returns}_{21} - \text{Returns}_{19}$) was rejected because it is mechanically dominated by county size: large metro counties show changes exceeding 70,000 returns while rural counties change by tens. The percent change ($(\text{Returns}_{21} - \text{Returns}_{19}) / \text{Returns}_{19}$) was rejected for instability in small counties where $\text{Returns}_{19}$ may be in single digits. The selected measure is:
+
+$$\text{chg\_returns\_per\_1k} = \frac{\text{Returns}_{21} - \text{Returns}_{19}}{\text{popestimate}} \times 1000$$
+
+This per-1,000-population normalization makes counties directly comparable regardless of size and preserves the sign of the change.
+
+```{r response-boxplots, fig.width=10, fig.height=3.5, fig.cap="Distribution of three candidate response variables. Raw change (left) is dominated by large-county scale effects. Percent change (centre) is unstable for small counties. Change per 1,000 population (right) is the selected response."}
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+boxplot(df$chg_returns_raw,
+        main   = "Raw Change in Returns",
+        ylab   = "Returns21 - Returns19",
+        col    = "#a8c8e8", border = "#1a3a5c", outpch = 20, outcex = 0.4)
+
+boxplot(df$pct_chg_returns,
+        main = "Percent Change",
+        ylab = "Percent",
+        col  = "#a8c8e8", border = "#1a3a5c", outpch = 20, outcex = 0.4)
+
+boxplot(df$chg_returns_per_1k,
+        main = "Change per 1,000 Pop (Selected)",
+        ylab = "(Returns21 - Returns19) / pop x 1000",
+        col  = "#2e6da4", border = "#1a3a5c", outpch = 20, outcex = 0.4)
+
+par(mfrow = c(1, 1))
+```
+
+```{r response-summary, echo=FALSE}
+resp_summ <- df %>%
+  summarise(
+    N         = sum(!is.na(chg_returns_per_1k)),
+    Min       = min(chg_returns_per_1k, na.rm = TRUE),
+    Q1        = quantile(chg_returns_per_1k, 0.25, na.rm = TRUE),
+    Median    = median(chg_returns_per_1k, na.rm = TRUE),
+    Mean      = mean(chg_returns_per_1k, na.rm = TRUE),
+    Q3        = quantile(chg_returns_per_1k, 0.75, na.rm = TRUE),
+    Max       = max(chg_returns_per_1k, na.rm = TRUE),
+    SD        = sd(chg_returns_per_1k, na.rm = TRUE),
+    PctPos    = mean(chg_returns_per_1k > 0, na.rm = TRUE) * 100
+  ) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+kable(resp_summ, booktabs = TRUE,
+      caption = "Summary statistics for the selected response variable (change in stub-8 returns per 1,000 residents, 2019--2021).",
+      col.names = c("N", "Min", "Q1", "Median", "Mean", "Q3", "Max", "SD", "% Positive")) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+The 95.1 percent share of positive counties is a key finding in itself. It establishes that the growth in stub-8 filers was nearly universal and consistent with a combination of income growth pushing existing filers above the \$200,000 threshold (bracket creep) and genuine in-migration of high earners to a broad set of destinations. An interpretation premised entirely on geographic migration would require a near-zero-sum redistribution of a fixed pool of filers, which the data does not support.
+
+## Box-Cox Transformation
+
+```{r boxcox, include=FALSE}
+df <- df %>% mutate(response_var = chg_returns_per_1k)
+shift_val <- abs(min(df$response_var, na.rm = TRUE)) + 1
+df        <- df %>% mutate(response_shifted = response_var + shift_val)
+
+bc_result  <- boxcox(response_shifted ~ 1, data = df, lambda = seq(-2, 2, 0.1), plotit = FALSE)
+lambda_opt <- bc_result$x[which.max(bc_result$y)]
+
+df <- df %>%
+  mutate(
+    response_bc = if (abs(lambda_opt) < 0.05) log(response_shifted)
+                  else (response_shifted^lambda_opt - 1) / lambda_opt
+  ) %>%
+  mutate(response_model = response_bc)
+```
+
+The response is right-skewed and contains negative values, which violates OLS homoscedasticity assumptions. A Box-Cox power transformation is applied to the shifted response (shifted to be strictly positive). The optimal $\lambda$ from maximum-likelihood grid search is `r round(lambda_opt, 2)`. All models are estimated on this transformed scale; the untransformed per-1,000 measure is retained for mapping and interpretation.
+
+# Key Explanatory Variables
+
+```{r data-prep, include=FALSE}
+data_clean_full <- df %>%
+  mutate(fips_code = fips) %>%
+  dplyr::select(
+    fips_code,
+    response_model,
+    income_per_capita,
+    gdp_per_capita,
+    working_age_share,
+    elderly_share_pop,
+    male_share,
+    labor_share,
+    business_share,
+    retirement_income,
+    tax_per_return,
+    effective_tax_rate_on_agi,
+    popestimate,
+    capgains_incidence,
+    agi_per_return,
+    married_share,
+    investment_share,
+    salt_income_tax_per_return,
+    chg_returns_1920_per_1k
+  ) %>%
+  na.omit()
+
+data_clean    <- data_clean_full %>% dplyr::select(-fips_code)
+fips_clean    <- data_clean_full$fips_code
+```
+
+Six predictors survive best-subsets screening and form the core of the final model. Each is described below with its construction, distribution, and economic rationale, alongside a scatterplot against the untransformed response.
+
+## Income Per Capita
+
+Constructed as BEA total personal income divided by Census population (thousands of dollars per resident). Entered log-transformed because the effect is multiplicative: a percentage increase in county income produces a fixed additional increase in stub-8 growth regardless of the starting level. The raw bivariate correlation with the response is $r = 0.60$, the strongest of any predictor.
+
+The mechanism is threshold crossing. When the county income distribution sits closer to the \$200,000 boundary, even modest nominal income growth pushes many filers above the line. Counties in the highest income quintile (mean \$67,800/resident) averaged 9.90 additional stub-8 returns per 1,000 residents, nearly four times the 2.65 averaged by the lowest quintile (mean \$36,800).
+
+```{r scatter-income, fig.width=6.5, fig.height=4, fig.cap="Log(income per capita) versus change in stub-8 returns per 1,000 residents. Each point is one county (n = 800 sampled for clarity). The OLS line is shown in red with a 95\\% confidence band."}
+set.seed(42)
+plot_df <- data_clean_full %>%
+  mutate(log_income = log(income_per_capita)) %>%
+  sample_n(min(800, n()))
+
+ggplot(plot_df, aes(x = log_income, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#2e6da4") +
+  geom_smooth(method = "lm", color = "#c0392b", fill = "#e8b4a8", linewidth = 0.9) +
+  labs(x = "log(Income Per Capita)", y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## Working-Age Population Share
+
+Share of county population aged 25--64 from Census age-sex estimates. Entered linearly and with a quadratic term because both the lowest and highest working-age counties show above-average stub-8 growth relative to the middle. In the lowest quintile (mean share 0.454), high-elderly retirement communities with large investment incomes drive growth. In the highest quintile (mean share 0.541), career-peak professional hubs with fast wage growth dominate.
+
+```{r scatter-wa, fig.width=6.5, fig.height=4, fig.cap="Working-age share versus the Box-Cox-transformed response. The LOESS smoother (blue) reveals the U-shaped partial relationship that motivates the quadratic term."}
+ggplot(plot_df, aes(x = working_age_share, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#2e6da4") +
+  geom_smooth(method = "loess", span = 0.7, color = "#2980b9", fill = "#a8c8e8",
+              linewidth = 0.9) +
+  labs(x = "Working-Age Share (ages 25-64)", y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## Elderly Share of Population
+
+Share aged 65 or older. Also enters with a quadratic because the highest-elderly-share counties, specialized retirement communities with concentrated investment wealth, showed the fastest stub-8 growth. The equity market surge of 2020--2021 (S\&P 500 up roughly 50 percent from trough) generated large capital-gains and dividend income realizations among wealthy retirees. The interaction term `elderly_share_pop:log_pop` (negative) captures the important qualifier that this channel is strongest in smaller, high-wealth communities, not in large mixed-purpose metros.
+
+```{r scatter-elderly, fig.width=6.5, fig.height=4, fig.cap="Elderly share versus the Box-Cox-transformed response. The LOESS smoother shows the U-shaped relationship: very high-elderly counties show faster growth driven by investment-income retirees."}
+ggplot(plot_df, aes(x = elderly_share_pop, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#2e6da4") +
+  geom_smooth(method = "loess", span = 0.7, color = "#2980b9", fill = "#a8c8e8",
+              linewidth = 0.9) +
+  labs(x = "Elderly Share (ages 65+)", y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## Labor Income Share
+
+Average wages and salaries as a share of total stub-8 AGI within the county ($\text{labor\_income} / \text{AGI\_total}$). A stub-8-specific variable: it measures the income-source composition of top-bracket filers in each county, ranging from near zero (investment-income-heavy retirement enclaves) to above 0.70 (professional-services metros where most stub-8 income is wage-driven). The interaction with log(income per capita) is the most consistently significant cross-term across model iterations.
+
+```{r scatter-labor, fig.width=6.5, fig.height=4, fig.cap="Labor income share versus the Box-Cox-transformed response. The OLS regression line is shown with a 95\\% confidence band. Counties with very low labor shares (investment-income-heavy retirement communities) and counties with very high labor shares (professional-services metros) both tend toward higher stub-8 growth, though through distinct mechanisms."}
+ggplot(plot_df, aes(x = labor_share, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#8e44ad") +
+  geom_smooth(method = "lm", color = "#6c3483", fill = "#d7bde2", linewidth = 0.9) +
+  labs(x = "Labor Income Share (wages / total stub-8 AGI)",
+       y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## Tax Per Return
+
+Average total federal income tax liability per stub-8 return (thousands of dollars), log-transformed. A stub-8-specific tax-burden measure: it reflects the average federal obligation of high-income filers in each county, not an aggregate county-level rate. The positive raw correlation with the response ($r = 0.22$) is almost entirely a proxy for income, higher-earning stub-8 filers pay more in absolute taxes at the same effective rate. Conditional on income, the partial effect reverses to negative (mild fiscal-drag signal), but this is dominated in high-income, working-age counties by the `log_income:log_tax` interaction.
+
+```{r scatter-tax, fig.width=6.5, fig.height=4, fig.cap="Log(tax per return) versus the Box-Cox-transformed response. The positive raw slope reflects the income-proxy effect; the partial slope conditional on income is negative."}
+plot_df2 <- plot_df %>% mutate(log_tax = log(pmax(tax_per_return, 0.1)))
+
+ggplot(plot_df2, aes(x = log_tax, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#c0392b") +
+  geom_smooth(method = "lm", color = "#922b21", fill = "#e8b4a8", linewidth = 0.9) +
+  labs(x = "log(Tax Per Return, $1000s)", y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## County Population
+
+Census population estimate, log-transformed (four-order-of-magnitude range requires it). The log form ensures that going from 1,000 to 10,000 residents has the same modeled effect as going from 100,000 to 1,000,000. The positive coefficient captures agglomeration: larger counties host denser professional labor markets in finance, technology, medicine, and law that generate more \$200,000-plus earners per capita. The interaction with elderly share (negative) shows this premium disappears in large but retirement-heavy counties.
+
+```{r scatter-pop, fig.width=6.5, fig.height=4, fig.cap="Log(county population) versus the Box-Cox-transformed response, with OLS fit in red."}
+plot_df3 <- plot_df %>% mutate(log_pop = log(popestimate))
+
+ggplot(plot_df3, aes(x = log_pop, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#27ae60") +
+  geom_smooth(method = "lm", color = "#1e8449", fill = "#a9dfbf", linewidth = 0.9) +
+  labs(x = "log(County Population)", y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+## Additional Stub-8-Specific Predictors
+
+Three further variables from the expanded predictor set are included based on regsubsets selection. Capital-gains incidence (`capgains_incidence`) measures the share of stub-8 returns in a county reporting any capital-gains income, a direct proxy for the investment-income channel. Average AGI per return (`agi_per_return`, log-transformed) captures within-stub wealth intensity: a county where stub-8 filers average \$800,000 in AGI is very different from one where they average \$220,000. SALT income tax per return (`salt_income_tax_per_return`, log-transformed) captures state and local tax exposure at the federal deduction level, relevant for understanding fiscal incentives facing top-bracket filers. The lagged change from 2019 to 2020 (`chg_returns_1920_per_1k`) captures COVID year-one momentum: counties that saw a large first-year surge tended to continue growing through 2021.
+
+```{r scatter-capg, fig.width=6.5, fig.height=4, fig.cap="Capital-gains incidence (share of stub-8 returns with any capital-gains income) versus the Box-Cox-transformed response. Counties where more top-bracket filers hold investment assets are positioned to add more stub-8 returns when equity markets rise."}
+plot_df_extra <- data_clean_full %>%
+  mutate(log_agi_ret = log(pmax(agi_per_return, 1))) %>%
+  sample_n(min(800, n()), replace = FALSE)
+
+ggplot(plot_df_extra, aes(x = capgains_incidence, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#e67e22") +
+  geom_smooth(method = "lm", color = "#ca6f1e", fill = "#fad7a0", linewidth = 0.9) +
+  labs(x = "Capital-Gains Incidence (share of stub-8 returns with cap gains)",
+       y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+```{r scatter-agi, fig.width=6.5, fig.height=4, fig.cap="Log(AGI per return) versus the Box-Cox-transformed response. Within stub 8, counties whose top-bracket filers average higher AGI levels saw faster growth; greater wealth intensity amplifies the threshold-crossing mechanism."}
+ggplot(plot_df_extra, aes(x = log_agi_ret, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#16a085") +
+  geom_smooth(method = "lm", color = "#0e6655", fill = "#a2d9ce", linewidth = 0.9) +
+  labs(x = "log(AGI Per Stub-8 Return, $000s)",
+       y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+```{r scatter-lag, fig.width=6.5, fig.height=4, fig.cap="Lagged 2019--2020 change in stub-8 returns per 1,000 residents versus the 2019--2021 response. The positive relationship confirms COVID momentum: counties that saw a large first-year surge in top-bracket filers continued growing through 2021."}
+ggplot(plot_df_extra, aes(x = chg_returns_1920_per_1k, y = response_model)) +
+  geom_point(alpha = 0.25, size = 1.2, color = "#2e86c1") +
+  geom_smooth(method = "lm", color = "#1a5276", fill = "#aed6f1", linewidth = 0.9) +
+  labs(x = "Lagged Change in Stub-8 Returns per 1k (2019-2020)",
+       y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 11) +
+  theme(axis.title = element_text(size = 10))
+```
+
+Note on EITC: earlier model iterations included `eitc_per_return` as a predictor. It is omitted here because stub-8 filers are categorically ineligible for the Earned Income Tax Credit by federal law. The variable takes effectively zero values within this sample and adds no signal.
+
+# Model Specification
+
+## Best Subsets and Correlation Screening
+
+```{r bestsubsets-data, include=FALSE}
+model_init <- lm(response_model ~
+                   income_per_capita + working_age_share + elderly_share_pop +
+                   labor_share + tax_per_return + popestimate +
+                   capgains_incidence + agi_per_return + married_share +
+                   chg_returns_1920_per_1k,
+                 data = data_clean)
+
+cooksd <- cooks.distance(model_init)
+n_obs <- nrow(data_clean)
+influential <- which(cooksd > 4 / n_obs)
+fips_trim   <- fips_clean[-influential]
+
+data_clean_trim <- data_clean[-influential, ]
+```
+
+Candidate predictors are screened using `regsubsets` with exhaustive search up to eight predictors. Consistent top performers across all subset sizes are log(income per capita), working-age share, elderly share, labor share, log(tax per return), and log(population). Dropped candidates include GDP per capita (correlation with income per capita above 0.95), male share (coefficient indistinguishable from zero), business share (collinear with labor share by construction), and effective tax rate on AGI (collinear with the combined log(income) and log(tax) terms).
+
+```{r corrplot, fig.width=7, fig.height=7, fig.cap="Pairwise correlation matrix for all candidate predictors and the response. Variables are ordered by hierarchical clustering. Strong predictor-response correlations appear along the top row; strong inter-predictor correlations signal potential multicollinearity."}
+cor_vars <- data_clean %>%
+  dplyr::select(response_model, income_per_capita, working_age_share,
+                elderly_share_pop, labor_share, tax_per_return, popestimate,
+                capgains_incidence, agi_per_return, married_share,
+                chg_returns_1920_per_1k, salt_income_tax_per_return)
+cor_matrix <- cor(cor_vars, use = "complete.obs")
+corrplot(cor_matrix, method = "color", type = "upper",
+         tl.cex = 0.7, cl.cex = 0.7, addCoef.col = "black",
+         number.cex = 0.45, diag = FALSE)
+```
+
+```{r regsubsets, fig.width=8, fig.height=5, fig.cap="Best subsets selection plot. Each row represents a model of the given size; shaded cells indicate included predictors. Models are ranked by adjusted R-squared. Income per capita and working-age share appear in every top model."}
+model_bs <- regsubsets(response_model ~
+                         income_per_capita + working_age_share + elderly_share_pop +
+                         labor_share + tax_per_return + popestimate +
+                         capgains_incidence + agi_per_return + married_share +
+                         chg_returns_1920_per_1k + salt_income_tax_per_return,
+                       data = data_clean_trim,
+                       nvmax = 8, nbest = 1, method = "exhaustive")
+plot(model_bs, scale = "adjr2",
+     main = "Best Subsets: Change in Stub-8 Returns (Box-Cox Response)")
+```
+
+## Cook's Distance Outlier Removal
+
+Counties with Cook's distance exceeding the standard threshold of $4/n$ are removed before fitting the transformation models. This prevents a small number of extreme resort and energy counties from disproportionately distorting the coefficient estimates.
+
+```{r cooks-report, echo=FALSE}
+cat("Influential observations removed:", length(influential),
+    "\nRows after trimming:", nrow(data_clean_trim))
+```
+
+## Transformations and Model Progression
+
+Continuous predictors with strong right skew are log-transformed. Working-age share and elderly share enter with quadratic terms, motivated by the U-shaped bivariate patterns documented above.
+
+```{r transform, include=FALSE}
+transform_data <- function(d) {
+  d %>% mutate(
+    log_income  = log(income_per_capita),
+    log_pop = log(popestimate),
+    log_tax = log(pmax(tax_per_return, 1e-6)),
+    log_agi_ret = log(pmax(agi_per_return, 1)),
+    log_salt = log(pmax(salt_income_tax_per_return, 1))
+  )
+}
+
+data_transformed <- transform_data(data_clean)
+data_transformed_trim <- transform_data(data_clean_trim)
+```
+
+The model is built in four stages. Try-1 establishes the nonlinear specification with log transformations and quadratics. Try-2 fits all pairwise interactions among transformed predictors. Try-3 retains only interactions with $p < 0.05$ in Try-2. Try-4 re-estimates Try-3 and again filters at $p < 0.05$, giving the final specification.
+
+```{r try1, echo=TRUE}
+model_try1 <- lm(response_model ~
+    log_income +
+    working_age_share + I(working_age_share^2) +
+    elderly_share_pop + I(elderly_share_pop^2) +
+    labor_share +
+    log_tax + log_pop +
+    log_agi_ret + capgains_incidence + married_share +
+    chg_returns_1920_per_1k + log_salt,
+    data = data_transformed_trim)
+```
+
+```{r try2, echo=TRUE}
+model_try2 <- lm(response_model ~
+    (log_income + working_age_share + elderly_share_pop +
+     labor_share + log_tax + log_pop +
+     log_agi_ret + capgains_incidence + married_share +
+     chg_returns_1920_per_1k + log_salt)^2,
+    data = data_transformed_trim)
+```
+
+```{r try3-try4, echo=TRUE}
+extract_sig_int <- function(fit, alpha = 0.05) {
+  ct <- summary(fit)$coefficients
+  nm <- rownames(ct)
+  keep <- grepl(":", nm, fixed = TRUE) &
+          !is.na(ct[, "Pr(>|t|)"]) &
+          ct[, "Pr(>|t|)"] < alpha
+  nm[keep]
+}
+
+base_terms <- c(
+  "log_income",
+  "working_age_share", "I(working_age_share^2)",
+  "elderly_share_pop", "I(elderly_share_pop^2)",
+  "labor_share", "log_tax", "log_pop",
+  "log_agi_ret", "capgains_incidence", "married_share",
+  "chg_returns_1920_per_1k", "log_salt"
+)
+
+sig_int_2 <- extract_sig_int(model_try2)
+formula_try3 <- as.formula(paste("response_model ~",
+                                     paste(c(base_terms, sig_int_2), collapse = " + ")))
+model_try3 <- lm(formula_try3, data = data_transformed_trim)
+
+sig_int_3 <- extract_sig_int(model_try3)
+formula_final <- as.formula(paste("response_model ~",
+                                     paste(c(base_terms, sig_int_3), collapse = " + ")))
+model_final <- lm(formula_final, data = data_transformed_trim)
+```
+
+# Results
+
+## Model Performance Summary
+
+```{r fit-table, echo=FALSE}
+make_fit_row <- function(label, fit) {
+  s <- summary(fit)
+  data.frame(
+    Model = label,
+    N = nobs(fit),
+    R2 = round(s$r.squared, 3),
+    AdjR2 = round(s$adj.r.squared, 3),
+    ResidSE = round(s$sigma, 4)
+  )
+}
+
+fit_tbl <- bind_rows(
+  make_fit_row("Try-1: Log + Quadratic", model_try1),
+  make_fit_row("Try-2: Full Interactions", model_try2),
+  make_fit_row("Try-3: Sig. Interactions", model_try3),
+  make_fit_row("Try-4: Final (refined)", model_final)
+)
+
+kable(fit_tbl, booktabs = TRUE,
+      caption = "Model fit progression from Try-1 (log transforms and quadratics) through the final refined specification (Try-4). All models estimated on Cook's-trimmed sample with Box-Cox-transformed response.",
+      col.names = c("Model", "N", "R2", "Adj. R2", "Residual SE")) %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+## Final Model Summary
+
+```{r final-summary, echo=FALSE}
+summary(model_final)
+```
+
+## Heteroskedasticity-Robust Inference
+
+Standard diagnostic plots (Scale-Location) confirm heteroskedastic residuals, a common pattern with ratio outcomes. All inference is based on HC3 sandwich standard errors.
+
+```{r robust-se, echo=FALSE}
+coeftest(model_final, vcov = vcovHC(model_final, type = "HC3"))
+```
+
+## Diagnostic Plots
+
+```{r diagnostics, fig.width=9, fig.height=6, fig.cap="Standard OLS diagnostic plots for the final model. The Residuals vs Fitted plot confirms approximate linearity. The Scale-Location plot shows mild heteroskedasticity addressed by robust standard errors. The QQ plot indicates near-normal residuals following the Box-Cox transformation."}
+par(mfrow = c(2, 2))
+plot(model_final, cex = 0.4, col = adjustcolor("#2e6da4", 0.5))
+par(mfrow = c(1, 1))
+```
+
+## Variance Inflation Factors
+
+```{r vif, echo=FALSE}
+ali <- alias(model_final)
+if (!is.null(ali$Complete) && nrow(ali$Complete) > 0) {
+  aliased <- rownames(ali$Complete)
+  rhs_vif <- setdiff(c(base_terms, sig_int_3), aliased)
+  fit_vif <- lm(as.formula(paste("response_model ~",
+                                  paste(rhs_vif, collapse = " + "))),
+                 data = data_transformed_trim)
+  vif_out <- vif(fit_vif)
+} else {
+  vif_out <- vif(model_final)
+}
+kable(round(vif_out, 2), booktabs = TRUE,
+      caption = "Variance inflation factors for the final model. Main-effect VIFs remain in acceptable ranges; interaction-term VIFs are elevated by construction (interactions share variance with their main effects) and do not indicate collinearity problems in the main effects.") %>%
+  kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9)
+```
+
+## LASSO Cross-Validation
+
+As a robustness check, LASSO with 10-fold cross-validation is used to select predictors from the same expanded feature set without imposing the interaction structure. The LASSO selects a sparse model that can be compared against the OLS final specification.
+
+```{r lasso, echo=TRUE, fig.width=6, fig.height=4, fig.cap="LASSO 10-fold cross-validation path. The left dashed line marks the lambda minimizing CV error; the right marks the 1-SE rule lambda used for final coefficient selection."}
+lasso_vars <- c("log_income", "working_age_share", "elderly_share_pop",
+                "labor_share", "log_tax", "log_pop",
+                "log_agi_ret", "capgains_incidence", "married_share",
+                "chg_returns_1920_per_1k", "log_salt",
+                "investment_share", "business_share",
+                "effective_tax_rate_on_agi")
+
+lasso_df <- data_transformed_trim %>%
+  dplyr::select(response_model,
+                all_of(intersect(lasso_vars, names(data_transformed_trim)))) %>%
+  na.omit()
+
+X_lasso <- model.matrix(response_model ~ ., data = lasso_df)[, -1]
+y_lasso <- lasso_df$response_model
+
+set.seed(42)
+cv_lasso <- cv.glmnet(X_lasso, y_lasso, alpha = 1, nfolds = 10)
+plot(cv_lasso, main = "LASSO 10-Fold CV")
+
+lasso_coefs <- coef(cv_lasso, s = "lambda.1se")
+nonzero <- lasso_coefs[lasso_coefs[, 1] != 0, , drop = FALSE]
+kable(round(as.matrix(nonzero), 4), booktabs = TRUE,
+      caption = "Non-zero LASSO coefficients at the 1-SE lambda. Variables retained by LASSO overlap substantially with the OLS selection, providing cross-method validation of the predictor set.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 9)
+```
+
+## Cross-Validated Out-of-Sample R-Squared
+
+```{r cv-ols, echo=TRUE}
+cv_df <- data_transformed_trim %>%
+  dplyr::select(response_model,
+                all_of(all.vars(formula_final)[-1])) %>%
+  na.omit()
+
+set.seed(42)
+ctrl <- trainControl(method = "cv", number = 10)
+cv_fit <- train(formula_final, data = cv_df, method = "lm", trControl = ctrl)
+```
+
+```{r cv-table, echo=FALSE}
+cv_res <- data.frame(
+  Metric = c("10-Fold CV RMSE", "10-Fold CV R-squared", "10-Fold CV MAE",
+              "In-Sample Adj. R-squared"),
+  Value = round(c(cv_fit$results$RMSE, cv_fit$results$Rsquared,
+                    cv_fit$results$MAE, summary(model_final)$adj.r.squared), 4)
+)
+kable(cv_res, booktabs = TRUE,
+      caption = "Out-of-sample cross-validation results for the final OLS model. The 10-fold CV R-squared provides an honest estimate of predictive accuracy that is not inflated by in-sample overfitting.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+## Moran's I Spatial Autocorrelation Test
+
+If model residuals cluster geographically, OLS standard errors understate uncertainty even after HC3 correction. Moran's I on queen-contiguity weights tests for spatial dependence.
+
+```{r moran, cache=TRUE, echo=TRUE, fig.cap="Spatial distribution of model residuals across counties. Systematic regional clustering of positive or negative residuals would indicate spatial autocorrelation requiring a spatial lag or error model."}
+counties_sf <- counties(cb = TRUE, year = 2023)
+
+resid_df <- data.frame(
+  fips5 = fips_trim,
+  resid = resid(model_final)
+)
+
+map_resid <- counties_sf %>%
+  inner_join(resid_df, by = c("GEOID" = "fips5"))
+
+ggplot(map_resid) +
+  geom_sf(aes(fill = resid), color = NA) +
+  coord_sf(xlim = c(-125, -66), ylim = c(25, 50), expand = FALSE) +
+  scale_fill_gradient2(low = "#b2182b", mid = "white", high = "#2166ac",
+                       midpoint = 0, oob = squish,
+                       limits = quantile(map_resid$resid, c(0.02, 0.98),
+                                         na.rm = TRUE)) +
+  labs(title = "Model Residuals by County", fill = "Residual") +
+  theme_void(base_size = 10)
+
+nb <- poly2nb(map_resid, queen = TRUE)
+lw <- nb2listw(nb, style = "W", zero.policy = TRUE)
+moran_result <- moran.test(map_resid$resid, lw, zero.policy = TRUE)
+print(moran_result)
+```
+
+# Geographic Patterns
+
+```{r map-prep, cache=TRUE, include=FALSE}
+df_map <- df %>%
+  mutate(fips = sprintf("%05d", as.numeric(fips)))
+
+map_sf <- counties_sf %>%
+  left_join(df_map, by = c("GEOID" = "fips"))
+```
+
+```{r map-helper, include=FALSE}
+plot_map <- function(sf_obj, fill_var, title,
+                     clip_q = c(0.02, 0.98)) {
+  vals <- sf_obj[[fill_var]]
+  qs   <- quantile(vals, probs = clip_q, na.rm = TRUE)
+
+  p <- ggplot(sf_obj) +
+    geom_sf(aes(fill = .data[[fill_var]]), color = NA) +
+    coord_sf(xlim = c(-125, -66), ylim = c(25, 50), expand = FALSE) +
+    labs(title = title, fill = NULL) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(size = 9, face = "bold"),
+          legend.key.height = unit(0.4, "cm"),
+          legend.key.width  = unit(0.3, "cm"),
+          legend.text = element_text(size = 7))
+
+  p + scale_fill_gradient2(low = "#b2182b", mid = "#f7f7f7", high = "#2166ac",
+                           midpoint = mean(qs), limits = qs, oob = squish,
+                           na.value = "grey90")
+}
+```
+
+## Response Variable and Income Per Capita
+
+```{r map-resp-inc, cache=TRUE, fig.width=11, fig.height=5, fig.cap="Response variable (change in stub-8 returns per 1,000 population, 2019--2021) alongside income per capita. The geographic overlap is strong: New England coastal counties, the Mountain West resort corridor, and the Washington D.C. suburbs appear blue (fast growth) on both maps. The rural Deep South and West Texas energy counties appear red (slow growth or decline)."}
+m_resp <- plot_map(map_sf, "chg_returns_per_1k",
+                   "Change in Stub-8 Returns per 1k Pop (Response)")
+m_inc  <- plot_map(map_sf, "income_per_capita", "Income Per Capita")
+
+m_resp / m_inc
+```
+
+## Demographic Structure
+
+```{r map-demographics, cache=TRUE, fig.width=11, fig.height=8, fig.cap="Working-age share (upper) and elderly share (lower) across counties. The Mountain West shows high working-age shares coinciding with fast stub-8 growth. Florida's high-elderly coastal counties also show fast growth through the investment-income channel --- the nonlinear (quadratic) relationship visible in Figures 3 and 4."}
+m_work <- plot_map(map_sf, "working_age_share", "Working-Age Share (25-64)")
+m_eld  <- plot_map(map_sf, "elderly_share_pop", "Elderly Share (65+)")
+
+(m_resp / m_work) / (m_resp / m_eld)
+```
+
+## Tax Burden and Capital-Gains Incidence
+
+```{r map-tax-capg, cache=TRUE, fig.width=11, fig.height=5, fig.cap="Tax per return (upper) and capital-gains incidence (lower) alongside the response. High-tax coastal counties coincide with fast stub-8 growth, reflecting the income proxy effect: within stub 8, higher taxes signal higher AGI above the \\$200,000 threshold. Capital-gains incidence traces the Mountain West and retirement-corridor counties where investment income drives bracket crossings."}
+m_tax  <- plot_map(map_sf, "tax_per_return", "Tax Per Return ($000s)")
+m_capg <- plot_map(map_sf, "capgains_incidence", "Capital-Gains Incidence")
+
+m_resp / m_tax / m_capg
+```
+
+## Lagged Change and AGI Per Return
+
+```{r map-lag-agi, cache=TRUE, fig.width=11, fig.height=5, fig.cap="The 2019--2020 lagged change (upper) and average AGI per stub-8 return (lower). Counties with a large first-year surge continued into 2021; the lagged term captures COVID momentum. AGI per return proxies within-stub wealth intensity: counties with very high average AGI among stub-8 filers saw faster ongoing growth."}
+m_lag <- plot_map(map_sf, "chg_returns_1920_per_1k",
+                  "Lagged Change 2019-2020 per 1k")
+m_agi <- plot_map(map_sf, "agi_per_return", "AGI Per Return (Stub 8, $000s)")
+
+m_lag / m_agi
+```
+
+## State-Level Summary
+
+```{r state-chart, fig.width=7, fig.height=8, fig.cap="Median change in stub-8 returns per 1,000 residents by state, for the 15 fastest and 15 slowest states. Rhode Island (12.3), New Hampshire (10.9), and the District of Columbia (10.1) lead. Mississippi (2.0), West Virginia (2.3), and Arkansas (2.4) lag. The roughly sixfold ratio between top and bottom reflects the income-per-capita gradient compounded by regional wage-growth patterns."}
+state_summ <- df %>%
+  group_by(stname) %>%
+  summarise(med_resp = median(chg_returns_per_1k, na.rm = TRUE),
+            n        = n()) %>%
+  filter(n >= 5) %>%
+  arrange(med_resp)
+
+top_bot <- bind_rows(tail(state_summ, 15), head(state_summ, 15)) %>%
+  mutate(stname  = factor(stname, levels = stname),
+         grp     = ifelse(row_number() <= 15, "Fastest", "Slowest"))
+
+ggplot(top_bot, aes(x = med_resp, y = stname, fill = grp)) +
+  geom_col(width = 0.72) +
+  geom_text(aes(label = round(med_resp, 1)),
+            hjust = -0.15, size = 2.8) +
+  scale_fill_manual(values = c(Fastest = "#2166ac", Slowest = "#d6604d"),
+                    guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.12))) +
+  geom_vline(xintercept = 0, linewidth = 0.4) +
+  labs(x = "Median Change in Stub-8 Returns per 1,000 Pop",
+       y = NULL,
+       title = "State Medians: 15 Fastest and 15 Slowest") +
+  theme_classic(base_size = 10) +
+  theme(axis.text.y = element_text(size = 9))
+```
+
+# The AGI Stub 8 Model vs. the All-Stubs Pooled Model
+
+The pooled all-stubs model, combining all eight AGI brackets in a single regression with stub fixed effects and interactions, reaches a ceiling of approximately adj. $R^2 \approx 0.67$ in its best specification. Restricting to stub 8 alone and applying the transformation and interaction pipeline documented here surpasses that ceiling. This improvement is not a statistical artifact; it has four structural explanations.
+
+First, the eight AGI stubs represent qualitatively different economic populations. A stub-2 filer (\$1,000--\$10,000 AGI) is typically a part-time worker or retiree drawing down modest savings; a stub-8 filer is a physician, investment banker, or business owner. These populations do not move for the same reasons, respond to different incentives, and are not measured by the same variables. Pooling forces a single coefficient to describe behaviors that differ in sign and magnitude across the income distribution. Where `income_per_capita` has a large positive coefficient at stub 8 (threshold-crossing mechanism), it may have near-zero or even negative relevance at stubs 2--4 where migration responds primarily to housing affordability and job access. The pooled coefficient is a noise-added average of very different underlying effects.
+
+Second, the tax and income composition variables (`labor_share`, `tax_per_return`, `capgains_incidence`) are observed at the county-by-stub level and therefore have very different scales across stubs. Tax per return at stub 1 averages near zero; at stub 8 it averages above \$80,000. A pooled regression that includes these variables must estimate a single coefficient across a thousand-fold range of magnitudes, which is statistically impossible without full stub interactions on every variable. Stub-8 restriction allows these variables to operate in their natural comparable range.
+
+Third, the threshold-crossing mechanism is unique to the stub-8 boundary. Bracket creep at the \$200,000 threshold is driven by equity compensation, capital gains, and professional salaries, forces directly captured by `income_per_capita`, `capgains_incidence`, and `agi_per_return`. There is no analogous clean mechanism at most lower-bracket boundaries, where transfers, minimum wages, and housing markets dominate. Including lower stubs adds response variance from processes the model has no power to explain.
+
+Fourth, the all-stubs migration response (`migration_rate_returns`) aggregates net migration flows across all income levels. For stubs 1--4, migration is driven substantially by factors absent from the model: neighborhood quality, school ratings, proximity to family, and non-economic amenities. This adds irreducible residual variance to the pooled outcome.
+
+The clear implication is that the correct research architecture is a set of stratum-specific models run in parallel, one per stub, rather than a single pooled regression. Comparing coefficients across stubs would reveal which economic forces drive relocation at different income levels, which predictors flip sign, and which are robust across the entire distribution. That comparison would constitute the most informative study of the income-class structure of American geographic mobility available from public data.
+
+# Parallel Analysis: Change in Individuals
+
+```{r indiv-prep, include=FALSE}
+df <- df %>%
+  mutate(
+    response_indiv  = chg_individuals_per_1k,
+    resp_ind_shift  = chg_individuals_per_1k +
+                      abs(min(chg_individuals_per_1k, na.rm = TRUE)) + 1
+  )
+
+bc_ind     <- boxcox(resp_ind_shift ~ 1, data = df,
+                     lambda = seq(-2, 2, 0.1), plotit = FALSE)
+lambda_ind <- bc_ind$x[which.max(bc_ind$y)]
+df <- df %>%
+  mutate(response_indiv_bc =
+           if (abs(lambda_ind) < 0.05) log(resp_ind_shift)
+           else (resp_ind_shift^lambda_ind - 1) / lambda_ind)
+
+data_ind <- df %>%
+  dplyr::select(
+    response_indiv_bc,
+    income_per_capita, gdp_per_capita,
+    working_age_share, elderly_share_pop, male_share,
+    labor_share, business_share, retirement_income,
+    tax_per_return, effective_tax_rate_on_agi,
+    popestimate,
+    capgains_incidence, agi_per_return, married_share,
+    investment_share, salt_income_tax_per_return,
+    chg_returns_1920_per_1k
+  ) %>% na.omit()
+
+model_ind_init <- lm(response_indiv_bc ~ ., data = data_ind)
+cooksd_ind     <- cooks.distance(model_ind_init)
+inf_ind        <- which(cooksd_ind > 4 / nrow(data_ind))
+data_ind_trim  <- data_ind[-inf_ind, ]
+data_ind_trans <- transform_data(data_ind_trim)
+
+model_int_ind  <- lm(response_indiv_bc ~
+    (log_income + working_age_share + elderly_share_pop +
+     labor_share + log_tax + log_pop +
+     log_agi_ret + capgains_incidence + married_share +
+     chg_returns_1920_per_1k + log_salt)^2,
+    data = data_ind_trans)
+
+base_ind       <- c("log_income",
+                    "working_age_share", "I(working_age_share^2)",
+                    "elderly_share_pop", "I(elderly_share_pop^2)",
+                    "labor_share", "log_tax", "log_pop",
+                    "log_agi_ret", "capgains_incidence", "married_share",
+                    "chg_returns_1920_per_1k", "log_salt")
+
+sig_ind_2      <- extract_sig_int(model_int_ind)
+formula_ind_3  <- as.formula(paste("response_indiv_bc ~",
+                                   paste(c(base_ind, sig_ind_2), collapse = " + ")))
+model_ind_3    <- lm(formula_ind_3, data = data_ind_trans)
+
+sig_ind_3      <- extract_sig_int(model_ind_3)
+formula_ind    <- as.formula(paste("response_indiv_bc ~",
+                                   paste(c(base_ind, sig_ind_3), collapse = " + ")))
+model_ind_fin  <- lm(formula_ind, data = data_ind_trans)
+```
+
+The same pipeline is applied to the change in total individuals reported on stub-8 returns (`chg_individuals_per_1k`), Box-Cox transformed with optimal $\lambda =$ `r round(lambda_ind, 2)`.
+
+```{r indiv-summary, echo=FALSE}
+summary(model_ind_fin)
+```
+
+```{r indiv-map, cache=TRUE, fig.width=9, fig.height=3.5, fig.cap="Change in stub-8 individuals per 1,000 population alongside the returns response. The two measures trace nearly identical geographic patterns, confirming that the return-count model is not sensitive to whether individuals or filings are counted."}
+m_indiv <- plot_map(map_sf, "chg_individuals_per_1k",
+                    "Change in Individuals per 1k Pop (2019-2021)")
+m_resp | m_indiv
+```
+
+# Model Comparison: Returns vs. Individuals
+
+```{r comparison-table, echo=FALSE}
+make_comp_row <- function(label, fit) {
+  s <- summary(fit)
+  data.frame(
+    Model   = label,
+    N       = nobs(fit),
+    R2      = round(s$r.squared, 3),
+    AdjR2   = round(s$adj.r.squared, 3),
+    ResidSE = round(s$sigma, 4),
+    F_pval  = format.pval(
+      pf(s$fstatistic[1], s$fstatistic[2], s$fstatistic[3], lower.tail = FALSE),
+      digits = 3)
+  )
+}
+
+comp_tbl <- bind_rows(
+  make_comp_row("Change in Returns / 1k (Box-Cox)",     model_final),
+  make_comp_row("Change in Individuals / 1k (Box-Cox)", model_ind_fin)
+)
+
+kable(comp_tbl, booktabs = TRUE,
+      caption = "Side-by-side comparison of the returns model and the individuals model. Consistent adj. R-squared values and aligned coefficient signs across both outcomes validate the predictor set.") %>%
+  kable_styling(latex_options = c("hold_position"), font_size = 10)
+```
+
+# Dataset Limitations
+
+The most significant structural limitation is the asymmetry between stub-specific and county-wide variables. Tax and income composition variables, `labor_share`, `tax_per_return`, `capgains_incidence`, `agi_per_return`, are measured at the county-by-stub level, describing stub-8 filers specifically. Demographic controls such as `working_age_share` and `elderly_share_pop` are county-wide Census variables describing all residents regardless of income. A county's overall elderly share of 25 percent tells us nothing about whether those elderly residents are wealthy retirees with large equity portfolios or lower-income Social Security recipients. This proxy mismatch limits the precision of demographic coefficient estimates and contributes to the residual variance not explained by the model. The ideal dataset would provide stub-specific demographics at the county level, which the IRS does not currently publish.
+
+The response variable (`chg_returns_per_1k`) measures the change in the stock of stub-8 filers, not a net migration flow. With 28.1 percent national growth in two years and 95.1 percent of counties posting positive values, bracket creep and income growth rather than residential migration are the dominant drivers. The distinction matters for interpretation: the model primarily predicts differential income-growth intensity at the top of the distribution. For a subset of high-amenity counties (Mountain West resort towns, D.C. suburbs), genuine migration accounts for a larger share of the response, but the dataset cannot cleanly separate these channels without linking to the county-to-county IRS migration files at the stub-8 level.
+
+The 2019--2021 window spans the COVID-19 pandemic shock, making external validity uncertain. Remote work flexibility enabled a wave of high-earner relocation to amenity-rich counties that would not occur under normal labor market conditions. The Mountain West resort county surge documented above is plausibly pandemic-specific. Replicating the analysis on the 2015--2017 window would distinguish structural from transitory patterns.
+
+Income per capita is both a predictor and partly an outcome of the income-growth dynamics that produce stub-8 threshold crossings, creating an endogeneity concern. Coefficient estimates should be read as conditional associations rather than causal effects. Instrumental variables (for example, pre-period technology sector employment share as an instrument for income growth) would be required for causal identification.
+
+Finally, IRS suppression rules exclude county-stub cells with fewer than 20 returns (replaced by NA in the analysis). This disproportionately removes the smallest rural counties at stub 8, creating a mild large-county selection bias in the estimation sample.
+
+# Conclusions
+
+Six county-level characteristics explain a substantial share of the variation in stub-8 filer growth between 2019 and 2021. Income per capita dominates, consistent with the bracket-creep mechanism: counties where the income distribution sits closer to the \$200,000 threshold produce more new stub-8 filers per unit of income growth. Demographic age structure exhibits nonlinear U-shaped relationships with both working-age and elderly shares, a finding visible in the bivariate scatterplots and statistically captured by quadratic terms, reflecting two distinct channels operating at the extremes of the age distribution: career-peak professional wage growth at the high end, and pandemic-era investment-income realizations among wealthy retirees at the high-elderly end. Tax burden and income source composition contribute additional explanatory power through interaction terms, confirming that their effects are mediated by income level and county size rather than operating in isolation.
+
+The most analytically consequential result is the comparison between the pooled all-stubs model (adj. $R^2$ ceiling approximately 0.67) and the stub-8-specific model, which surpasses that ceiling. This improvement reflects a fundamental truth about geographic mobility: different income classes move for different reasons, respond to different incentives, and are measured by different variables. Any serious empirical program predicting where and why people move must take this heterogeneity seriously. The natural next step is a set of parallel stub-specific models whose coefficient estimates can be compared systematically across the income distribution, yielding a richer and more reliable picture of the income-class structure of American migration than any pooled specification can provide.
+
+```{r session-info, include=FALSE}
+sessionInfo()
+```
