@@ -1,0 +1,846 @@
+---
+title: "AGI Stub 8 Analysis"
+author: "Rihaan"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+  fig.align = "center", dev = "png", dpi = 110, fig.retina = 1)
+
+data_path <- "~/Desktop/Spring 26 MAP/MAP/Best Subsets for MAP/Code/22-23/AGI8/county_1923_May3AGI8_SK.csv"
+```
+
+```{r packages, include=FALSE}
+library(mosaic)
+library(tidyverse)
+library(corrplot)
+library(leaps)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(car)
+library(lmtest)
+library(MASS)
+library(sandwich)
+library(sf)
+library(tigris)
+library(patchwork)
+library(knitr)
+options(tigris_use_cache = TRUE)
+```
+
+# Introduction
+
+This report studies how the population of high-income tax filers changed across U.S. counties between 2019 and 2021. The IRS Statistics of Income (SOI) data divides every county's filing population into eight Adjusted Gross Income (AGI) brackets, called stubs. Stub 8 is the top bracket: returns reporting AGI of $200,000 or more. Top-bracket earners are the smallest group in number but the largest in fiscal weight, paying roughly 38% of all federal income tax receipts, so changes in where they file have first-order consequences for state and local public finance.
+
+Nationally, the count of stub-8 returns grew by roughly 28% between 2019 and 2021. That two-year jump is far larger than any plausible net migration of high earners, so most of the growth reflects two non-migration channels: bracket creep (income growth pushing existing filers above the $200,000 threshold) and capital-gains realizations from the 2020 to 2021 equity-market rally. A smaller share is genuine residential mobility (the pandemic-era relocation wave to lower-cost or higher-amenity counties). The model in this report does not separate these channels; it predicts the total growth in stub-8 filers per 1,000 residents in each county and identifies which county-level characteristics best explain that growth.
+
+The analytical pipeline has four main stages. First, choose a response variable from three candidates (raw change, percent change, change per 1,000 population) and apply a Box-Cox power transformation to make the residuals approximately normal and homoskedastic. Second, identify and remove two groups of predictors that cannot honestly enter the model: variables that are structurally zero at stub 8 (the EITC family) and variables that are themselves derived from the same year-over-year filer counts that produce the response (the IRS migration family). Third, reduce the remaining ~40 candidate predictors to a top 8 through three thematic best-subsets sweeps and a pooled re-competition, fit the untransformed top-8, and use Cook's distance to trim high-influence outlier counties before going further. Fourth, layer log transformations, quadratic terms, and pairwise interactions on the top 8, keep the significant interactions, and run one final exhaustive best-subsets pass over that feature set to pick the model that maximizes adjusted R-squared.
+
+# Data Sources
+
+The analysis dataset joins three federal sources at the five-digit county FIPS code:
+
+- IRS Statistics of Income (SOI) county-level tax-return tables, which provide stub-8 return counts and a rich set of income composition, deduction, and tax liability variables computed from individual returns filed in each county and bracket.
+- IRS SOI migration data (county-to-county inflow and outflow of returns, individuals, and aggregate AGI).
+- U.S. Census Bureau intercensal population estimates and Bureau of Economic Analysis (BEA) per-capita personal income and GDP for 2019 through 2022.
+
+The file used here (`county_1923_May3AGI8_SK.csv`) is already filtered to `agi_stub == 8`, so each row represents one county at the top income bracket. The national sample is roughly 3,100 counties.
+
+One important data property deserves highlighting The income-composition and tax variables (labor share, tax per return, mortgage interest per return, etc.) are observed at the county-by-stub level: they describe stub-8 filers specifically within each county. The demographic variables (working-age share, elderly share, male share) are county-wide Census variables describing all residents regardless of income. This asymmetry between stub-specific tax variables and county-wide demographic proxies is a hard limitation of the SOI data and is revisited in the limitations section.
+
+## Loading and Renaming
+
+The raw column names follow IRS-internal conventions. I rename them once to make every downstream summary easier to read. Two conventions are imposed: `pct_filers_*` for share-of-filers variables (originally suffixed `_incidence`), and the explicit suffixes `_filers` and `_persons` on the migration variables so the unit being counted is always clear.
+
+```{r load}
+df_raw <- read.csv(data_path, fileEncoding = "cp1252", check.names  = TRUE)
+
+df_raw <- df_raw %>%
+  dplyr::select(-any_of(c("stname.1", "ctyname.1", "fips.1")))
+
+df_raw <- df_raw %>% rename(
+  population = popestimate, elderly_share = elderly_share_pop,
+  transfer_share = transfer_like_share, pct_filers_wages = wage_incidence,
+  pct_filers_capgains = capgains_incidence, pct_filers_business = business_incidence,
+  pct_filers_rental = rental_incidence,
+  pct_filers_unempl = unemployment_incidence,
+  pct_filers_mortgage = mortgage_interest_incidence,
+  pct_filers_proptax= property_tax_incidence, pct_filers_eitc = eitc_incidence,
+  eff_tax_rate_agi = effective_tax_rate_on_agi,
+  eff_tax_rate_taxable = effective_tax_rate_on_taxable,
+  credits_share = credits_share_of_tax_before,
+  mortgage_per_return = mortgage_interest_per_return,
+  proptax_per_return = property_tax_per_return,
+  salt_income_per_return = salt_income_tax_per_return,
+  salt_sales_per_return = salt_sales_tax_per_return,
+  refund_ctc_per_return = refundable_ctc_per_return,
+  refund_edu_per_return = refundable_edu_per_return,
+  refund_eitc_proxy_per_return = refundable_eitc_proxy_per_return,
+  eitc_per_claimant = eitc_per_eitc_return,
+  migration_rate_filers = migration_rate_returns,
+  migration_rate_persons = migration_rate,
+  net_migration_filers = net_migration_returns_not_AGI,
+  net_migration_persons = net_migration_not_AGI,
+  inflow_filers = inflow_returns, outflow_filers= outflow_returns)
+```
+
+```{r build-response}
+df <- df_raw %>%
+  filter(agi_stub == 8) %>%
+  filter(!is.na(Returns19), !is.na(Returns21),
+         !is.na(Individuals19), !is.na(Individuals21))
+
+df <- df %>%
+  mutate(
+    chg_returns_raw = Returns21 - Returns19,
+    chg_individuals_raw  = Individuals21- Individuals19,
+    chg_returns_per_1k  = (Returns21 - Returns19) / population * 1000,
+    chg_individuals_per_1k  = (Individuals21 - Individuals19) / population * 1000,
+    pct_chg_returns = ifelse(Returns19 > 0,(Returns21 - Returns19) / Returns19 * 100, NA_real_),
+    pct_chg_individuals = ifelse(Individuals19 > 0,
+(Individuals21 - Individuals19) / Individuals19 * 100,NA_real_))
+```
+
+# Response Variable
+
+Three candidate response variables were considered. Each represents the same underlying quantity (the change in stub-8 returns between 2019 and 2021) but on a different scale. The boxplots below compare their distributions on the same sample.
+
+```{r response-boxplots, fig.width=10, fig.height=3.5, fig.cap="Distribution of the three candidate response variables. Raw change is dominated by large-county scale effects; percent change is unstable in small counties where Returns19 is small; change per 1,000 population is well-scaled and chosen as the response."}
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+
+boxplot(df$chg_returns_raw,
+        main = "Raw change",
+        ylab = "Returns21 - Returns19",
+        col  = "lightblue")
+
+boxplot(df$pct_chg_returns,
+        main = "Percent change",
+        ylab = "% change",
+        col  = "skyblue")
+
+boxplot(df$chg_returns_per_1k,
+        main = "Change per 1,000 pop (selected)",
+        ylab = "(Returns21 - Returns19) / pop * 1000",
+        col  = "steelblue")
+
+par(mfrow = c(1, 1))
+```
+
+The raw difference is dominated by a few large counties (the maximum is roughly two orders of magnitude above the IQR), so any regression on it would fit county size rather than the drivers of interest. The percent change is unstable when `Returns19` is small: in low-population rural counties even a single-digit change blows up into a huge percentage. The per-1,000-population scaling sits between these two: it removes the county-size dependence without amplifying small-denominator noise. It is also the natural unit for comparing growth rates across counties of different sizes.
+
+```{r response-summary}
+resp_summ <- df %>%
+  summarise(
+    N = sum(!is.na(chg_returns_per_1k)),
+    Min = min(chg_returns_per_1k, na.rm = TRUE),
+    Q1 = quantile(chg_returns_per_1k, 0.25, na.rm = TRUE),
+    Median = median(chg_returns_per_1k, na.rm = TRUE),
+    Mean = mean(chg_returns_per_1k, na.rm = TRUE),
+    Q3 = quantile(chg_returns_per_1k, 0.75, na.rm = TRUE),
+    Max = max(chg_returns_per_1k, na.rm = TRUE),
+    SD = sd(chg_returns_per_1k, na.rm = TRUE),
+    PctPos = mean(chg_returns_per_1k > 0, na.rm = TRUE) * 100) %>%
+  mutate(across(where(is.numeric), round, 2))
+
+resp_summ
+```
+
+The response is mostly positive: the median county added about 4 to 5 stub-8 filings per 1,000 residents between 2019 and 2021, and roughly 95 percent of counties post positive values. As noted in the introduction, this is consistent with bracket-creep and capital-gains realizations rather than zero-sum migration.
+
+## Box-Cox transformation
+
+The response is right-skewed and contains a small number of negative values, both of which violate OLS homoskedasticity and normality assumptions. To fix this I apply a Box-Cox power transformation: shift the response to be strictly positive, then find the lambda that maximizes the Box-Cox log-likelihood and apply that power transformation. All regression models below use the Box-Cox-transformed response; the raw `chg_returns_per_1k` is retained for descriptive maps, boxplots, and the conclusion's summary statistics.
+
+```{r set-response}
+# Keep the raw per-1k response for descriptive plots and reporting
+df <- df %>% mutate(response_raw = chg_returns_per_1k)
+
+# Shift to be strictly positive, then find the optimal Box-Cox lambda
+shift_val <- abs(min(df$response_raw, na.rm = TRUE)) + 1
+df <- df %>% mutate(response_shifted = response_raw + shift_val)
+
+bc_result <- MASS::boxcox(response_shifted ~ 1, data = df,
+                           lambda = seq(-2, 2, 0.1), plotit = FALSE)
+lambda_opt <- bc_result$x[which.max(bc_result$y)]
+cat("Box-Cox optimal lambda:", round(lambda_opt, 2), "\n")
+
+df <- df %>% mutate(
+  response_var = if (abs(lambda_opt) < 0.05) log(response_shifted)
+                 else (response_shifted ^ lambda_opt - 1) / lambda_opt)
+```
+
+# Issue with EITC?
+
+The Earned Income Tax Credit is targeted at low and moderate income working households. Eligibility phases out well below $200,000 of AGI, so at stub 8 there are no EITC values by design. The four EITC-related columns in the dataset should therefore be zero everywhere in the stub-8 sample, and they are:
+
+```{r eitc-check}
+eitc_cols <- c("pct_filers_eitc", "eitc_per_return",
+               "eitc_per_claimant", "refund_eitc_proxy_per_return")
+sapply(df[eitc_cols], function(v) {
+  c(min = suppressWarnings(min(v, na.rm = TRUE)),
+    max = suppressWarnings(max(v, na.rm = TRUE)),
+    mean = suppressWarnings(mean(v, na.rm = TRUE)),
+    n_nonzero = sum(v != 0, na.rm = TRUE),
+    n_NA = sum(is.na(v)))})
+```
+
+These are structural zeros rather than missing data. The same applies to the refundable child-tax-credit and refundable education-credit columns at this stub. Variables with zero variance break `regsubsets` (which requires non-constant predictors), so they must be excluded from the group.
+
+```{r eitc-drop}
+zero_var_cols <- c("agi_stub", "pct_filers_eitc", "eitc_per_return",
+                   "eitc_per_claimant", "refund_eitc_proxy_per_return",
+                   "refund_edu_per_return")
+```
+
+# Candidate Pool
+
+The candidate pool is built by taking every numeric column and removing four kinds of variables: identifiers (FIPS codes, names), response variants (the change measures themselves and the raw 2019 to 2022 return counts that produced them), pre-summed totals (aggregate AGI, total tax liability, etc., which are mechanically tied to the response), and the structural zeros from the EITC check.
+
+```{r pool}
+identifiers <- c("stname", "ctyname", "fips", "STATEFIPS", "COUNTYFIPS")
+response_like <- c("Returns19", "Returns20", "Returns21", "Returns22",
+                   "Individuals19", "Individuals20",
+                   "Individuals21", "Individuals22",
+                   "returns", "individuals",
+                   "chg_returns_raw", "chg_individuals_raw",
+                   "chg_returns_per_1k", "chg_individuals_per_1k",
+                   "pct_chg_returns", "pct_chg_individuals",
+                   "response_var")
+
+totals_or_redundant <- c("agi_total", "income_total",
+                         "labor_income", "business_income",
+                         "investment_income", "rental_income",
+                         "retirement_income", "transfer_like_income",
+                         "non_labor_income",
+                         "tax_before_credits_total", "credits_total",
+                         "tax_after_credits_total",
+                         "total_tax_liability", "total_tax_payments",
+                         "avg_individuals_per_return")
+
+# Variables that are themselves derived from filer-count differences (the
+# same upstream quantity that produces the response). Including them would
+# let the model "predict" the response with a re-scaled version of itself.
+# These are excluded from the candidate pool for the regression and only
+# kept around for descriptive maps.
+
+calculation_vars <- c("migration_rate_filers", "migration_rate_persons",
+                      "net_migration_filers", "net_migration_persons",
+                      "inflow_filers", "outflow_filers", "inflow_agi", 
+                      "outflow_agi", "net_income_migration")
+
+candidate_pool <- setdiff(names(df)[sapply(df, is.numeric)],
+                          c(identifiers, response_like,
+                            totals_or_redundant, zero_var_cols,
+                            calculation_vars))
+
+data_clean <- df %>% dplyr::select(response_var, all_of(candidate_pool)) %>%
+  na.omit()
+```
+
+A note on the exclusion: The migration variables in this dataset (`migration_rate_filers`, `migration_rate_persons`, `net_migration_filers`, `net_migration_persons`, `inflow_filers`, `outflow_filers`, `inflow_agi`, `outflow_agi`, `net_income_migration`) are all built from the same year-over-year IRS filer counts that produce the response. Letting them into the regression would amount to predicting the change in filers with a rescaled version of the change in filers, which inflates adj R-squared without adding economic content. They are kept in the file for descriptive county maps but are not used in the model selection or fit.
+
+# Best Subsets in Three Sets:
+
+The candidate pool is too wide for a single exhaustive `regsubsets` call (cost grows exponentially with the number of predictors, and `leaps` itself caps out around 30 variables). I split the pool into three disjoint thematic groups and run an exhaustive search within each. The winners from each group are then pooled and re-competed in a final exhaustive pass.
+
+The three groups are: demographics and macro income/tax; income composition (where stub-8 income comes from); and tax structure, housing, and deductions. Migration variables are deliberately excluded from all three sets for the reason described above.
+
+```{r bss-helpers}
+top_vars_from_subsets <- function(rs) {
+  ss <- summary(rs)
+  best_idx <- which.max(ss$adjr2)
+  setdiff(names(coef(rs, best_idx)), "(Intercept)")
+}
+
+fit_and_diag <- function(rs, data, response = "response_var", title = "") {
+  vars <- top_vars_from_subsets(rs)
+  f   <- as.formula(paste(response, "~", paste(vars, collapse = " + ")))
+  fit <- lm(f, data = data)
+  cat("===", title, "===\n")
+  cat("Best vars (", length(vars), "):\n  ",
+      paste(vars, collapse = ", "), "\n", sep = "")
+  cat("Adj R^2 = ", round(summary(fit)$adj.r.squared, 4),
+      "  |  Resid SE = ", round(summary(fit)$sigma, 3), "\n", sep = "")
+  par(mfrow = c(2, 2))
+  plot(fit, main = title, cex = 0.4, col = adjustcolor("steelblue", 0.5))
+  par(mfrow = c(1, 1))
+  list(vars = vars, fit = fit, adjr2 = summary(fit)$adj.r.squared)
+}
+```
+
+## Set 1: Demographics and macro income/tax
+
+```{r set1, fig.width=8, fig.height=5}
+set1_vars <- intersect(c(
+  "population", "child_share", "working_age_share",
+  "elderly_share", "male_share",
+  "single_share", "married_share", "hoh_share",
+  "income_per_capita", "gdp_per_capita", "gdp_income_ratio",
+  "agi_per_return", "income_per_return", "agi_per_person",
+  "tax_per_return", "eff_tax_rate_agi", "eff_tax_rate_taxable"), candidate_pool)
+
+rs1 <- regsubsets(response_var ~ .,
+                  data = data_clean[, c("response_var", set1_vars)],
+                  nvmax = 8, nbest = 1, method = "exhaustive")
+
+plot(rs1, scale = "adjr2", main = "Set 1: demographics + macro income/tax")
+```
+
+```{r set1-diag, fig.width=8, fig.height=6}
+set1 <- fit_and_diag(rs1, data_clean, title = "Set 1 best model")
+```
+
+The diagnostic panel shows the heteroskedastic fan in residuals-vs-fitted that is typical when dollar-valued predictors enter on the linear scale, plus heavy tails in the QQ plot. Both will be addressed by the log transformations applied later. For now I keep all winners from this set without modification and move on.
+
+## Set 2: Income composition
+
+The income-share variables (`labor_share`, `business_share`, `investment_share`, and so on) sum to roughly one by construction, so `leaps` will report a small number of linear dependencies in this set. That is expected.
+
+```{r set2, fig.width=8, fig.height=5}
+set2_vars <- intersect(c(
+  "labor_share", "business_share", "investment_share",
+  "rental_share", "retirement_share",
+  "transfer_share", "non_labor_share",
+  "pct_filers_wages", "pct_filers_capgains", "pct_filers_business",
+  "pct_filers_rental", "pct_filers_unempl"), candidate_pool)
+
+rs2 <- regsubsets(response_var ~ .,
+                  data = data_clean[, c("response_var", set2_vars)],
+                  nvmax = 8, nbest = 1, method = "exhaustive")
+
+plot(rs2, scale = "adjr2", main = "Set 2: income composition")
+```
+
+```{r set2-diag, fig.width=8, fig.height=6}
+set2 <- fit_and_diag(rs2, data_clean, title = "Set 2 best model")
+```
+
+Income-share predictors are weaker in isolation than the Set 1 demographics. That makes sense: at the top bracket the income mix is fairly homogeneous across counties (mostly wages and capital gains), so there is less between-county variation for the model to use. The set still contributes its top winners to the pool.
+
+## Set 3: Tax structure, housing, and deductions
+
+```{r set3, fig.width=8, fig.height=5}
+set3_vars <- intersect(c(
+  "mortgage_per_return", "proptax_per_return",
+  "salt_income_per_return", "salt_sales_per_return",
+  "pct_filers_mortgage", "pct_filers_proptax",
+  "credits_share",
+  "refund_ctc_per_return"), candidate_pool)
+
+rs3 <- regsubsets(response_var ~ .,
+                  data = data_clean[, c("response_var", set3_vars)],
+                  nvmax = 8, nbest = 1, method = "exhaustive")
+
+plot(rs3, scale = "adjr2", main = "Set 3: tax structure / housing / deductions")
+```
+
+```{r set3-diag, fig.width=8, fig.height=6}
+set3 <- fit_and_diag(rs3, data_clean, title = "Set 3 best model")
+```
+
+This set isolates the housing-deduction and state-tax channel that Sets 1 and 2 cannot see. The mortgage interest and property tax deductions per return are the strongest predictors here; they essentially trace the geography of expensive housing markets (the coastal metros and a handful of mountain-resort counties) where the stub-8 population is densest and growing. The SALT income tax deduction adds a smaller but distinct signal coming from the high-state-tax states (NY, NJ, CA, MA, IL).
+
+# Pooling and Final Reduction
+
+## Pool the three winners
+
+```{r pool-vars}
+pooled_vars <- unique(c(set1$vars, set2$vars, set3$vars))
+pooled_vars
+```
+
+## Correlation
+
+Before running the final best-subsets pass I check the correlation structure of the pooled candidates and drop near-duplicates.
+
+```{r corr-pool, fig.width=8, fig.height=8, fig.cap="Correlation matrix of the pooled candidates from Sets 1 to 3. Pairs above |r| = 0.85 are dropped before the final best-subsets pass."}
+pooled_cor <- cor(data_clean[, pooled_vars])
+corrplot(pooled_cor, method = "color", type = "upper",
+         tl.cex = 0.7, addCoef.col = "grey30", number.cex = 0.55)
+```
+
+```{r corr-prune}
+cor_threshold <- 0.85
+
+hi_corr <- which(abs(pooled_cor) > cor_threshold & upper.tri(pooled_cor),
+                 arr.ind = TRUE)
+
+if (nrow(hi_corr) > 0) {
+  to_drop <- unique(colnames(pooled_cor)[hi_corr[, "col"]])
+  pairs_dropped <- apply(hi_corr, 1, function(ij) {
+    sprintf("%s <-> %s (r=%.2f)",
+            rownames(pooled_cor)[ij[1]], colnames(pooled_cor)[ij[2]],
+            pooled_cor[ij[1], ij[2]])
+  })
+  cat("Pairs above |r|=", cor_threshold, ":\n  ", sep = "")
+  cat(paste(pairs_dropped, collapse = "\n  "), "\n", sep = "")
+  cat("Dropped:\n  ", paste(to_drop, collapse = ", "), "\n", sep = "")
+  pooled_vars <- setdiff(pooled_vars, to_drop)
+} else {
+  cat("No high-correlation duplicates above ", cor_threshold, "\n", sep = "")
+}
+cat("Pool after pruning:", length(pooled_vars), "vars\n")
+```
+
+## Final best-subsets pass
+
+```{r bss-final, fig.width=8, fig.height=5}
+data_pooled <- data_clean[, c("response_var", pooled_vars)]
+rs_final <- regsubsets(response_var ~ ., data = data_pooled,
+                       nvmax = 10, nbest = 1, method = "exhaustive")
+plot(rs_final, scale = "adjr2",
+     main = "Final best-subsets on the pruned pool")
+ss_final     <- summary(rs_final)
+adjr2_size   <- round(ss_final$adjr2, 4)
+cat("Adj R^2 by model size:\n"); print(adjr2_size)
+```
+
+To pick the model size, I take the smallest model whose adj R-squared is within 
+0.005 of the maximum, capped at 8 predictors.
+
+```{r elbow}
+max_adj  <- max(ss_final$adjr2)
+elbow <- min(which(ss_final$adjr2 >= max_adj - 0.005))
+top_size <- min(elbow, 8)
+top_vars <- setdiff(names(coef(rs_final, top_size)), "(Intercept)")
+
+cat("Chosen size:", top_size, "  elbow=", elbow,
+    "  argmax adj R^2 size=", which.max(ss_final$adjr2), "\n", sep = " ")
+cat("Top vars:\n  ", paste(top_vars, collapse = ", "), "\n", sep = "")
+```
+
+## Untransformed top model + residuals
+
+Before applying any transformations I fit the chosen top-k model on the raw scale and look at the diagnostic plots and residuals-vs-predictor plots. This tells me which variables need logs or quadratics in the next stage.
+
+```{r top-fit, fig.width=8, fig.height=6, fig.cap="Standard diagnostic panels for the untransformed top model. The fan in residuals-vs-fitted and the heavy QQ tails motivate the log transformations applied in the next section."}
+formula_top <- as.formula(paste("response_var ~",
+                                paste(top_vars, collapse = " + ")))
+model_top   <- lm(formula_top, data = data_pooled)
+summary(model_top)
+
+par(mfrow = c(2, 2))
+plot(model_top, main = "Untransformed top model",
+     cex = 0.4, col = adjustcolor("steelblue", 0.5))
+par(mfrow = c(1, 1))
+```
+
+```{r top-resid, fig.width=10, fig.height=8, fig.cap="Residuals against each predictor in the untransformed top model. Predictors whose plots fan out or curve are logged (continuous dollar/count measures); pure shares are kept linear; the two age-share variables get an added quadratic term."}
+md <- model.frame(model_top)
+rv <- resid(model_top)
+nc <- ceiling(sqrt(length(top_vars)))
+par(mfrow = c(nc, nc))
+for (v in top_vars) {
+  plot(md[[v]], rv,
+       main = paste("Residuals vs", v),
+       xlab = v, ylab = "Residual",
+       pch = 20, col = adjustcolor("steelblue", 0.4))
+  abline(h = 0, col = "red")
+}
+par(mfrow = c(1, 1))
+```
+
+The fan in residuals-vs-fitted and the heavy QQ tails point to a log on the dollar- and count-valued predictors. The residuals-vs-predictor panels confirm it: every dollar measure shows a heavy right tail, while the pure proportion variables (shares) are well-behaved. The two age-share variables (`working_age_share`, `elderly_share`) sometimes show mild curvature, which motivates an added quadratic term.
+
+## Cook's distance trimming
+
+Before refitting on the transformed scale, I trim observations that exert outsized influence on the OLS fit. These are typically resort and tourism counties (Aspen, Vail, Park City), university towns (Cambridge, Princeton), and energy-extraction counties (parts of North Dakota and west Texas) that behave qualitatively differently from the broader cross-section and disproportionately drag the fitted surface toward themselves. The rule used here is the standard threshold of Cook's distance greater than 4/n.
+
+```{r cooks-trim, fig.width=7, fig.height=4, fig.cap="Cook's distance for each county. The horizontal line is the trimming threshold (4/n); counties above the line are removed from the regression sample before the transformed models are fit."}
+cooksd <- cooks.distance(model_top)
+n_obs <- nrow(data_pooled)
+threshold <- 4 / n_obs
+influential <- which(cooksd > threshold)
+
+cat("Sample size before trim:", n_obs, "\n")
+cat("Influential counties dropped (Cook's > 4/n):", length(influential), "\n")
+cat("Sample size after trim:", n_obs - length(influential), "\n")
+
+plot(cooksd, pch = 20, col = adjustcolor("steelblue", 0.5),
+     main = "Cook's distance per county",
+     xlab = "Observation index", ylab = "Cook's distance")
+abline(h = threshold, col = "red", lty = 2)
+
+data_pooled_trim <- data_pooled[-influential, ]
+data_clean_trim  <- data_clean[-influential, ]
+```
+
+The transformed models from Try-1 onwards are fit on `data_clean_trim`. The descriptive scatterplots in the next section are also drawn on the trimmed sample, since that is the sample the model actually estimates on.
+
+# Main Explanatory Variables
+
+This section gives a one-paragraph description of each variable in the top-k selection, followed by a bivariate scatterplot against the response. The descriptions explain how each variable is constructed and the most likely economic reason it correlates with the change in stub-8 filings.
+
+```{r var-descriptions}
+var_descriptions <- list(
+  population = "Census Bureau county population estimate (2022). Larger counties host denser professional labor markets in finance, technology, medicine, and law that produce more stub-8 filers per capita. The variable enters log-transformed because the range is enormous: from a few hundred residents in some rural counties to almost ten million in Los Angeles County. An interesting observation is that population on its own is a weaker predictor than expected at stub 8; the response is per-capita already, so size effects have been partly netted out. Population mostly matters through its interaction with income and age structure.",
+  income_per_capita = "BEA total personal income divided by Census population, in thousands of dollars per resident. The single strongest predictor in the bivariate scatter. The mechanism is threshold-crossing: counties whose income distribution already sits close to $200,000 see many filers cross the stub-8 line on even modest nominal income growth. A back-of-envelope intuition is that doubling income per capita roughly quadruples the number of households above the $200k threshold, because incomes are approximately log-normally distributed. Log-transformed in the model because the effect is multiplicative rather than linear.",
+  gdp_per_capita = "BEA county GDP divided by Census population. Closely related to income per capita but measures production rather than household earnings, so it picks up energy and manufacturing counties that have high output relative to wages (oil and gas counties in Texas and North Dakota, for example). Included as a robustness check on the income measure; log-transformed.",
+  agi_per_person = "Total county AGI (across all stubs) divided by population. A tax-side analogue of income per capita that uses IRS-reported AGI rather than BEA personal income. The two measures agree on the broad geography but differ on the details: AGI per person tends to be lower than income per capita because it excludes non-taxable transfers and underreports certain capital-income items. Same threshold-crossing mechanism.",
+  agi_per_return = "Average AGI per stub-8 return in each county, in thousands of dollars. Captures within-stub wealth intensity. A county where stub-8 filers average 800k in AGI is qualitatively different from one where they average 220k: in the former, equity-compensation realizations and capital-gains dynamics dominate; in the latter, ordinary salary growth does. Enters log-transformed.",
+  working_age_share = "Census share of population aged 25 to 64. The classic professional-hub indicator: New York City, Washington DC, the San Francisco Bay Area, and Seattle all sit at the high end. Enters linearly with a quadratic term because both very low and very high working-age shares show above-average stub-8 growth (retirement counties at the low end, peak-career metros at the high end).",
+  elderly_share = "Census share of population aged 65 or older. Two opposing mechanisms compete here. Retirement-heavy counties have less wage growth (a negative pull on the response) but realized very large capital gains during the 2020 to 2021 equity-market rally (a positive pull). The Florida coastal counties, Arizona retirement communities, and the South Carolina low-country show up clearly as high-elderly-share counties with fast stub-8 growth. Quadratic term captures the U-shape.",
+  male_share = "Census share of male residents. A weaker predictor on its own. Partly proxies for industry composition: counties dominated by male-heavy sectors like energy extraction, construction, and shipping often have higher male shares. The geographic pattern is concentrated in the northern Plains and energy counties in Texas, North Dakota, and Wyoming.",
+  married_share = "Census share of married households. Correlates with two-earner professional households that are more likely to clear the stub-8 threshold (two physicians, two lawyers, two software engineers in one household sum past 200k very easily).",
+  labor_share = "Share of stub-8 AGI in the county that comes from wages and salaries (as opposed to capital gains, retirement income, etc.). This is a stub-specific variable: it describes the income mix of the top-bracket filers in this county, not the county as a whole. Counties where stub-8 income is mostly labor (the professional-services metros) saw more bracket crossings driven by wage growth in 2019 to 2021. Counties where stub-8 income is mostly capital gains saw growth driven by the equity-market rally instead, captured by the interaction terms in the final model.",
+  retirement_share = "Share of stub-8 AGI from retirement sources (pensions, IRA withdrawals, etc.). Negative or weak in the model: retirement income is more stable than wage or capital-gains income and contributed less to bracket creep over this window. Counties with high retirement_share tend to be retirement destinations where stub-8 growth is slower in absolute terms.",
+  transfer_share = "Share of stub-8 AGI from transfer-like income (taxable Social Security, unemployment compensation, alimony, etc.). At stub 8 this is small, typically below 5 percent of AGI, but the cross-county variation matters: counties with relatively high transfer share at the top bracket tend to be retiree-heavy regions where a meaningful slice of stub-8 income is taxable Social Security. Expected sign in the model is negative.",
+  non_labor_share = "One minus labor share, so the complement: the share of stub-8 AGI from capital gains, business income, rental income, and similar non-wage sources. Mechanically collinear with labor_share by construction, so usually only one of the two is kept by the correlation prune.",
+  business_share = "Share of stub-8 AGI from sole-proprietor and pass-through business income. Highest in regions with many small businesses or in farming counties.",
+  investment_share = "Share of stub-8 AGI from dividends, interest, and capital gains. Strongly co-moves with the equity market, so its 2019-to-2021 level is unusually high relative to a normal economic window.",
+  rental_share = "Share of stub-8 AGI from rental real estate. Small at stub 8 nationally but concentrated in resort and high-housing-cost counties.",
+  tax_per_return = "Average federal income tax liability per stub-8 return in the county, in thousands of dollars. A stub-specific tax-burden measure (not a county-wide rate). Note that the positive raw correlation with the response is mostly an income-proxy effect: high-tax counties are high-tax because their stub-8 filers earn more, not because tax burden itself attracts filers. Conditional on income, the partial effect can flip negative, which the interactions in the final model capture.",
+  mortgage_per_return = "Average mortgage interest deduction per stub-8 return. High values are tightly geographically concentrated in expensive coastal metros: the Bay Area, NYC suburbs, Boston, DC, San Diego, Seattle, Los Angeles. The variable is essentially a proxy for housing costs at the stub-8 level. Positively correlated with the response because expensive-housing counties have growing high-earner populations driven by both income growth and selective in-migration.",
+  proptax_per_return = "Average property tax deduction per stub-8 return. Geography mirrors mortgage interest, with extra weight on NJ, IL, and TX (which have above-average property tax rates regardless of housing prices).",
+  salt_income_per_return = "Average state-and-local income tax deduction per stub-8 return. Reflects exposure to state-level income taxation; high in CA, NY, NJ, MA, OR, and a few other states. After the 2017 SALT cap of $10,000, this variable became much more relevant as a measure of net fiscal pressure on high earners.",
+  salt_sales_per_return = "Average state-and-local sales tax deduction per stub-8 return. Filers can deduct either state income tax or state sales tax (whichever is larger), so this variable is most relevant in the no-income-tax states (TX, FL, WA, NV, TN, SD, WY) where filers naturally take the sales-tax deduction.",
+  pct_filers_capgains = "Share of stub-8 returns in the county that report any capital gains income. A direct measure of how exposed top-bracket filers in a county are to financial-market dynamics. Highest in the Bay Area, NYC, Boston, and a number of mountain-resort counties. Strongly positive in 2019 to 2021 because the equity-market rally produced large realized gains.",
+  pct_filers_mortgage = "Share of stub-8 returns that itemize mortgage interest. A complement to mortgage_per_return: that variable measures dollar exposure, this one measures household reach. Used in Set 3 but tends to be highly correlated with mortgage_per_return and pruned out.",
+  pct_filers_proptax = "Share of stub-8 returns that itemize property tax. Similar geographic pattern to pct_filers_mortgage.",
+  credits_share = "Average share of pre-credit tax that ends up wiped out by federal tax credits (CTC, education, etc.). At stub 8 most credits are phased out, so this share is small and varies relatively little across counties.",
+  refund_ctc_per_return = "Average refundable child tax credit received per stub-8 return. Essentially zero at this stub for the same phase-out reason as EITC; included only as a robustness check on the structural-zero argument from the EITC section."
+)
+```
+
+```{r var-prose, results="asis"}
+for (v in top_vars) {
+  cat("##", v, "\n\n")
+  desc <- var_descriptions[[v]]
+  if (is.null(desc)) desc <- paste("Variable", v,
+"selected by the best-subsets pipeline; no detailed description on file.")
+  cat(desc, "\n\n")
+}
+```
+
+The plot below shows one bivariate regression scatter per selected predictor: the predictor on the x-axis and the Box-Cox-transformed response on the y-axis. The red line is the OLS fit and the shaded band is its 95 percent confidence interval. The sample matches the trimmed sample used by the regression models (the high-Cook's counties are removed). None of these predictors are derived from the response, so each line is a genuine cross-county relationship.
+
+```{r var-scatters-gg, fig.width=10, fig.height=7, fig.cap="Bivariate regression scatterplots of each selected predictor against the Box-Cox-transformed response. The red line is the OLS fit; the shaded band is its 95 percent confidence interval. Predictors that curve or fan are logged or quadratically transformed in the next section."}
+scatter_df <- data_clean_trim %>%
+  dplyr::select(response_var, all_of(top_vars)) %>%
+  tidyr::pivot_longer(-response_var, names_to = "predictor", values_to = "x")
+
+ggplot(scatter_df, aes(x = x, y = response_var)) +
+  geom_point(alpha = 0.25, size = 0.9, color = "steelblue") +
+  geom_smooth(method = "lm", color = "firebrick", fill = "salmon",
+              linewidth = 0.8, alpha = 0.35) +
+  facet_wrap(~ predictor, scales = "free_x", ncol = 3) +
+  labs(x = NULL, y = "Response (Box-Cox transformed)") +
+  theme_classic(base_size = 10) +
+  theme(strip.background = element_blank(),
+        strip.text = element_text(size = 9))
+```
+
+A few personal observations from the scatter panel. Income per capita and AGI per person produce the cleanest linear relationships with the response; their confidence intervals are tight and the slope is unambiguous. The two age-share variables (working-age and elderly) both show visible curvature, which is exactly what motivates the quadratic terms applied in the next section. The deduction variables (mortgage per return, property tax per return, SALT income per return) are right-skewed with a long tail of expensive-coastal-metro counties; in the linear scale this looks like a dense cluster near zero with a few outliers far to the right, which is why these variables are logged in the next step. The pure share variables (labor share, retirement share) are well-behaved and stay on the linear scale.
+
+# Transformations and Interactions
+
+The diagnostic plots above motivate three changes: log the heavy-tailed predictors, add quadratic terms for the two age shares, and let the predictors interact pairwise (since the threshold-crossing mechanism depends on combinations like income x population, not on either variable alone).
+
+## Try-1: log + quadratic main effects
+
+```{r transform}
+log_candidates <- c("population", "income_per_capita", "gdp_per_capita",
+                    "tax_per_return", "mortgage_per_return",
+                    "proptax_per_return",
+                    "salt_income_per_return", "salt_sales_per_return",
+                    "agi_per_return", "income_per_return",
+                    "agi_per_person",
+                    "net_income_migration", "inflow_agi", "outflow_agi",
+                    "inflow_filers", "outflow_filers",
+                    "refund_ctc_per_return")
+needs_log  <- intersect(top_vars, log_candidates)
+quad_terms <- intersect(top_vars,
+                        c("working_age_share", "elderly_share"))
+
+# Build the transformed dataset on the Cook's-trimmed sample so all
+# Try-1 through Try-4 models are estimated on the same observations.
+data_transformed <- data_clean_trim
+for (v in needs_log) {
+  data_transformed[[paste0("log_", v)]] <-
+    log(pmax(data_transformed[[v]], 1e-6))
+}
+
+base_rhs <- sapply(top_vars, function(v) {
+  if (v %in% needs_log) paste0("log_", v) else v
+})
+if (length(quad_terms) > 0) {
+  base_rhs <- c(base_rhs, paste0("I(", quad_terms, "^2)"))
+}
+base_terms_returns <- unname(base_rhs)
+
+cat("Logged predictors:\n  ", paste(needs_log,  collapse = ", "), "\n", sep = "")
+cat("Quadratic terms:\n  ", paste(quad_terms, collapse = ", "), "\n", sep = "")
+cat("Try-1 right-hand side:\n  ",
+    paste(base_terms_returns, collapse = ", "), "\n", sep = "")
+```
+
+```{r try1}
+model_try1 <- lm(as.formula(paste("response_var ~",
+                                  paste(base_terms_returns, collapse = " + "))),
+                 data = data_transformed)
+summary(model_try1)
+```
+
+```{r try1-lift}
+summary(model_try1)$adj.r.squared - summary(model_top)$adj.r.squared
+```
+
+## Try-2: full pairwise interactions
+
+The base specification is expanded to include every pairwise product of the main-effect terms (quadratic terms are not interacted, only added back at the end).
+
+```{r try2}
+main_effects <- base_terms_returns[!grepl("^I\\(", base_terms_returns)]
+inter_rhs <- paste0("(", paste(main_effects, collapse = " + "), ")^2")
+quad_rhs <- base_terms_returns[grepl("^I\\(", base_terms_returns)]
+all_rhs <- if (length(quad_rhs) > 0)
+  paste(inter_rhs, "+", paste(quad_rhs, collapse = " + ")) else inter_rhs
+
+model_interaction <- lm(as.formula(paste("response_var ~", all_rhs)),
+                        data = data_transformed)
+summary(model_interaction)
+
+cat("Try-2 adj R^2:", round(summary(model_interaction)$adj.r.squared, 4), "\n")
+```
+
+## Try-3: keep only interactions significant at p < 0.05
+
+```{r try3}
+extract_sig_interactions <- function(fit, alpha = 0.05) {
+  ct <- summary(fit)$coefficients
+  if (!"Pr(>|t|)" %in% colnames(ct)) return(character(0))
+  nm <- rownames(ct)
+  is_int <- grepl(":", nm, fixed = TRUE)
+  pvals  <- ct[, "Pr(>|t|)"]
+  keep   <- is_int & !is.na(pvals) & pvals < alpha
+  nm[keep]
+}
+
+sig_int_returns <- extract_sig_interactions(model_interaction, alpha = 0.05)
+cat("Significant interactions from Try-2 (", length(sig_int_returns), "):\n  ",
+    paste(sig_int_returns, collapse = ", "), "\n", sep = "")
+
+rhs_returns <- paste(c(base_terms_returns, sig_int_returns), collapse = " + ")
+model_final <- lm(as.formula(paste("response_var ~", rhs_returns)),
+                  data = data_transformed)
+cat("Try-3 adj R^2:", round(summary(model_final)$adj.r.squared, 4), "\n")
+summary(model_final)
+```
+
+## Try-4: final best subsets on the Try-3 feature set
+
+Try-3 carries every base term plus every significant interaction. To find the genuinely best-fitting final specification, I run one more exhaustive best-subsets pass over that full feature set and pick the size that maximizes adjusted R-squared. This is the same idea as the earlier set-level best-subsets sweeps, just applied at the feature-and-interaction level rather than the raw-variable level. Try-4 is the final model carried into the diagnostics and the side-by-side comparison.
+
+```{r try4-design}
+mm <- model.matrix(model_final)[, -1]
+
+clean_names <- function(x) {
+  x <- gsub(":", "_x_", x, fixed = TRUE)
+  x <- gsub("I\\(", "sq_", x)
+  x <- gsub("\\^2\\)", "", x)
+  x <- gsub("[()]", "", x)
+  x
+}
+orig_names <- colnames(mm)
+colnames(mm) <- clean_names(orig_names)
+name_map <- setNames(orig_names, colnames(mm))
+
+bss_df <- as.data.frame(mm)
+bss_df$response_var <- data_transformed$response_var
+
+cat("Design matrix:", nrow(mm), "rows x", ncol(mm), "features\n")
+```
+
+```{r try4-bss, fig.width=8, fig.height=5}
+nvmax_final <- ncol(mm)
+
+rs_final2 <- regsubsets(response_var ~ ., data = bss_df,
+                        nvmax = nvmax_final, nbest = 1,
+                        method = "exhaustive", really.big = TRUE)
+
+ss2 <- summary(rs_final2)
+
+cat("Adj R^2 by size:\n"); print(round(ss2$adjr2, 4))
+
+plot(rs_final2, scale = "adjr2",
+     main = "Try-4 best subsets on the Try-3 feature set (adj R^2)")
+```
+
+
+```{r try4-fit}
+size_final <- which.max(ss2$adjr2)
+final_best_cnames <- setdiff(names(coef(rs_final2, size_final)), "(Intercept)")
+final_best_terms <- unname(name_map[final_best_cnames])
+
+cat("Chosen size (argmax adj R^2):", size_final, "\n")
+cat("Final-best features:\n", paste(final_best_terms, collapse = ", "), "\n", sep = "")
+
+model_final_best <- lm(as.formula(paste("response_var ~",
+                    paste(final_best_cnames, collapse = " + "))), data = bss_df)
+
+cat("\nTry-4 (final-best) adj R^2:",
+    round(summary(model_final_best)$adj.r.squared, 4), "\n")
+
+summary(model_final_best)
+```
+
+```{r try4-compare}
+# Side-by-side fit comparison: Try-0 through Try-4
+
+fit_progression <- data.frame(
+  Stage   = c("Try-0 (untransformed top)",
+              "Try-1 (logs + quad)",
+              "Try-2 (all pairwise interactions)",
+              "Try-3 (Try-2 sig interactions)",
+              "Try-4 (BSS over Try-3 features)"),
+  AdjR2   = round(c(summary(model_top)$adj.r.squared,
+                    summary(model_try1)$adj.r.squared,
+                    summary(model_interaction)$adj.r.squared,
+                    summary(model_final)$adj.r.squared,
+                    summary(model_final_best)$adj.r.squared), 4),
+  NFeatures = c(length(top_vars),
+                length(coef(model_try1)) - 1,
+                length(coef(model_interaction)) - 1,
+                length(coef(model_final)) - 1,
+                length(coef(model_final_best)) - 1))
+
+fit_progression
+```
+
+The reason for dropping so many variables between try 2 through 4 was for the sake of parsimony.
+
+# Final Model Diagnostics
+
+All diagnostics below are computed on the Try-4 final model (`model_final_best`), which is the best-subsets pick over the Try-3 feature set.
+
+```{r final-diag, fig.width=8, fig.height=6, fig.cap="Diagnostic plots for the Try-4 final model. Residuals are approximately centered with mild heteroskedasticity, addressed by the HC1 robust standard errors below."}
+par(mfrow = c(2, 2))
+plot(model_final_best, cex = 0.4, col = adjustcolor("steelblue", 0.5))
+par(mfrow = c(1, 1))
+```
+
+```{r final-robust}
+coeftest(model_final_best, vcov = vcovHC(model_final_best, type = "HC1"))
+```
+
+```{r final-vif}
+ali <- alias(model_final_best)
+if (!is.null(ali$Complete) && nrow(ali$Complete) > 0) {
+  aliased_terms <- rownames(ali$Complete)
+  cat("Aliased terms (dropped before VIF):\n  ",
+      paste(aliased_terms, collapse = ", "), "\n", sep = "")
+  rhs_for_vif <- setdiff(final_best_cnames, aliased_terms)
+  fit_for_vif <- lm(as.formula(paste("response_var ~",
+                                     paste(rhs_for_vif, collapse = " + "))),
+                    data = bss_df)
+  print(vif(fit_for_vif))
+} else {
+  print(vif(model_final_best))
+}
+```
+
+# County Maps
+
+All maps below use the same red-white-blue diverging palette so that patterns can be compared directly across panels. Each variable is centered on its own median: red counties are below the typical county on that variable and blue counties are above. Centering on the median (rather than on zero) is what produces a balanced red-to-blue contrast in the change maps; if I centered on zero instead, the response map would be almost entirely blue because roughly 95 percent of counties grew their stub-8 population over this window. Tail values are quantile-clipped at the 2nd and 98th percentiles so a handful of extreme counties do not dominate the color scale.
+
+```{r map-prep, cache=TRUE}
+counties_sf <- counties(cb = TRUE, year = 2023)
+
+df_map <- df %>% mutate(fips = sprintf("%05d", as.numeric(fips)))
+map_sf <- counties_sf %>%
+  left_join(df_map, by = c("GEOID" = "fips"))
+```
+
+```{r map-helper}
+plot_map <- function(sf_obj, fill_var, title,
+                     midpoint = NA, clip_q = c(0.02, 0.98)) {
+  vals <- sf_obj[[fill_var]]
+  qs   <- quantile(vals, probs = clip_q, na.rm = TRUE)
+  mid  <- if (is.na(midpoint)) median(vals, na.rm = TRUE) else midpoint
+
+  ggplot(sf_obj) +
+    geom_sf(aes(fill = .data[[fill_var]]), color = NA) +
+    coord_sf(xlim = c(-125, -66), ylim = c(25, 50), expand = FALSE) +
+    labs(title = title, fill = NULL) +
+    theme_void(base_size = 9) +
+    theme(plot.title = element_text(size = 9),
+          legend.key.height = unit(0.4, "cm"),
+          legend.key.width  = unit(0.3, "cm"),
+          legend.text = element_text(size = 7)) +
+    scale_fill_gradient2(low = "darkred", mid = "white", high = "darkblue",
+                         midpoint = mid,
+                         limits = qs, oob = scales::squish,
+                         na.value = "grey90")
+}
+```
+
+## Response variable and key predictors
+
+```{r maps-returns, fig.width=11, fig.height=6, cache=TRUE, dependson="map-prep", fig.cap="Geographic distribution of the response and four key predictors. The Sun Belt, Mountain West, and Texas / Florida metros show above-median top-bracket growth (blue); the rural Plains, parts of the Midwest, and pockets of the Deep South are below median (red)."}
+
+m_resp  <- plot_map(map_sf, "chg_returns_per_1k",
+                    "Change in stub-8 returns / 1k pop, 2019 to 2021")
+m_work <- plot_map(map_sf, "working_age_share", "Working-age share (2022)")
+m_eld <- plot_map(map_sf, "elderly_share", "Elderly share (2022)")
+m_labor <- plot_map(map_sf, "labor_share", "Labor income share (stub 8, 2022)")
+m_tax <- plot_map(map_sf, "tax_per_return","Tax per return (stub 8, 2022)")
+m_inc <- plot_map(map_sf, "income_per_capita", "Income per capita (2022)")
+m_mort <- plot_map(map_sf, "mortgage_per_return",
+                    "Mortgage interest per return (stub 8, 2022)")
+
+(m_resp | m_work) / (m_eld | m_labor)
+(m_resp | m_tax)  / (m_mort | m_inc)
+```
+
+A few observations from the maps. The response map (top-left in each pair) shows two clear gradients. The first is the well-known Sun Belt and Mountain West story: Texas, Florida, the Carolinas, Tennessee, Arizona, Idaho, Utah, and Colorado all appear in blue. The second is more subtle and worth flagging: the entire urban-coastal corridor from Boston through DC also appears blue, even though that corridor lost net population during the pandemic. Both patterns are visible because the response is per capita, so a county can shrink in absolute population while still adding stub-8 filers per 1,000 residents.
+
+The predictor maps line up with the response map in instructive ways. Income per capita and tax per return both light up the same coastal-metro corridor that is blue on the response map; mortgage interest per return picks out the most expensive housing markets specifically (the Bay Area, NYC suburbs, Boston, DC, parts of Florida). The elderly-share map is the most interesting one: very-high-elderly counties in Florida and Arizona are blue on both the elderly-share map and on the response, which is the equity-rally capital-gains channel for retirees, exactly the mechanism that motivated the quadratic term on elderly share. The working-age and labor-income-share maps are the noisiest of the six; both vary more by region than by metro, and their relationship to the response shows up more clearly in the regression than in the geography.
+
+## Individuals response
+
+```{r maps-indiv, fig.width=11, fig.height=3.2, cache=TRUE, dependson="map-prep", fig.cap="The change in stub-8 individuals (left) traces nearly the same geography as the change in returns (top of the previous figure). The two responses move together because one return covers one or two individuals."}
+
+m_indiv <- plot_map(map_sf, "chg_individuals_per_1k",
+                    "Change in stub-8 individuals / 1k pop, 2019 to 2021")
+
+m_indiv | m_work | m_eld
+```
+
+
+# Limitations
+
+The 2019 to 2021 window spans the COVID-19 pandemic shock, which makes external validity uncertain. Remote-work flexibility enabled a relocation wave that would not have happened under normal conditions, so the geographic patterns may be partly pandemic-specific. Repeating this exercise on a pre-pandemic window (e.g., 2015 to 2017) would help separate structural patterns from transitory ones.
+
+One technical limitation worth flagging is that the `na.omit` step in the candidate-pool construction drops counties that are missing any of the numeric predictors, reducing the working sample significantly. This is a wide-data version of the IRS suppression rule (which removes county-stub cells with fewer than 20 returns) and biases the working sample toward larger, more data-rich counties.
+
+Additionally, the IRS migration variables (net migration filers and persons, inflow and outflow filers and AGI, migration rates) are excluded from the candidate pool because they are themselves constructed from the same year-over-year filer counts that produce the response. Letting them in would inflate adj R-squared without adding economic content. The county-to-county SOI migration files at the stub-8 level (not used here) would be the right way to bring a genuine migration channel into the model.
+
+# Conclusions
+
+Summary of main findings:
+
+The final model (Try-4, the best-subsets pick over the Try-3 feature set) reaches an adjusted R-squared of 0.6939 on 21 features. Twenty-one out of the original ~40 candidate predictors and their pairwise interactions are enough to explain about 69% of the cross-county variation in top-bracket filer growth.
+
+The strongest single predictors of stub-8 growth are county income per capita and AGI per person on the income side, average mortgage interest and SALT income tax deductions on the housing-and-taxation side, and the elderly and working-age population shares on the demographic side. Male share, labor income share, and transfer share enter mostly through interactions with income, not as standalone main effects.
+
+Box-Cox transforming the response (optimal lambda around 0.6) and trimming about 112 high-leverage counties via Cook's distance lift the model from adjusted R-squared 0.57 to 0.69, a clean +0.12 gain. EITC and the refundable child and education credits are excluded from the candidate pool because they are structurally zero at AGI stub 8 by design. The IRS migration variables (net migration, inflow, outflow, migration rate) are excluded because they are themselves derived from the same filer counts that produce the response; including them would inflate the fit inaccurately, rather than through real economic content.
+
+The two-year national growth in stub-8 returns is roughly 28%, far too large to be migration in any conventional sense. The data is most consistent with bracket creep, capital-gains realizations during the 2020 to 2021 equity-market rally, and a smaller share of genuine residential mobility. The model identifies where these forces concentrate geographically (the Sun Belt, the Mountain West, the Texas and Florida metros, and the coastal-corridor professional hubs).
+
+# Final thoughts and Extension of Research
+
+Closing thoughts:
+
+A small and economically coherent set of county characteristics, when combined with a Box-Cox transformation of the response and an outlier-trimmed estimation sample, explains a substantial share of the variation in top-bracket filer growth between 2019 and 2021. The final best-subsets model reaches an adjusted R-squared of 0.6939, which is a strong result for a cross-sectional county-level regression and well above the ceiling of any specification that ignored the methodological details. The model's predictive power comes mostly from the threshold-crossing mechanism: counties whose income distribution sits closer to the $200,000 stub-8 boundary produce more new top-bracket filers per unit of nominal income growth, and the variables that pick this up most cleanly (income per capita, AGI per person, the deduction proxies for housing-cost exposure) are exactly the ones the best-subsets pipeline keeps in every iteration.
+
+The next step would be to repeat the same pipeline on the lower AGI stubs and compare coefficients across the income distribution. Top-bracket filers respond to a relatively coherent set of forces including income growth, capital gains, and expensive-housing geography, but those same forces work very differently for stubs 1 through 4, where housing affordability, transfer eligibility, and job access dominate.
+
+
+
